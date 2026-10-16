@@ -1,12 +1,14 @@
-//! Library half of the template.
+//! UV-Vis spectrum viewer for JASCO text exports.
 //!
 //! Keeping the app in a library (rather than entirely in `main.rs`) means the
-//! state and update logic stay unit-testable — see the tests at the bottom of
-//! [`app`].
+//! parsing, processing and state logic stay unit-testable.
 
 pub mod app;
+pub mod color;
+pub mod jasco;
+pub mod processing;
 
-pub use app::TemplateApp;
+pub use app::UvViewerApp;
 
 /// Display name, used for the window title and the eframe persistence key.
-pub const APP_NAME: &str = "egui Template";
+pub const APP_NAME: &str = "UV Viewer";

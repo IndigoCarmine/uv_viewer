@@ -1,61 +1,418 @@
 //! The application state and its per-frame update logic.
-//!
-//! Replace the demo widgets in [`TemplateApp::update`] with your own UI; the
-//! surrounding scaffolding (persistence, panels, about dialog) is what the
-//! template is really providing.
 
+use std::path::PathBuf;
+
+use egui::{Color32, RichText};
+use egui_plot::{Legend, Line, Plot};
 use serde::{Deserialize, Serialize};
 
-/// Persisted application state.
+use crate::color::{self, ColorMode, Colormap};
+use crate::jasco::{self, Dataset};
+use crate::processing::{self, Baseline, Normalize};
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+enum BaselineKind {
+    None,
+    RangeMean,
+    TwoPoint,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+enum NormalizeKind {
+    None,
+    Max,
+    AtX,
+}
+
+/// Processing settings shared by every curve.
 ///
-/// `#[serde(default)]` matters for a real app: it lets you add fields later
-/// without invalidating the state files already on your users' machines.
+/// The parameters of each mode are kept even while another mode is selected,
+/// so switching back and forth does not lose them.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+struct Processing {
+    baseline_kind: BaselineKind,
+    range: [f64; 2],
+    points: [f64; 2],
+    normalize_kind: NormalizeKind,
+    norm_x: f64,
+}
+
+impl Default for Processing {
+    fn default() -> Self {
+        Self {
+            baseline_kind: BaselineKind::None,
+            range: [480.0, 500.0],
+            points: [400.0, 500.0],
+            normalize_kind: NormalizeKind::None,
+            norm_x: 350.0,
+        }
+    }
+}
+
+impl Processing {
+    fn baseline(&self) -> Baseline {
+        match self.baseline_kind {
+            BaselineKind::None => Baseline::None,
+            BaselineKind::RangeMean => Baseline::RangeMean {
+                lo: self.range[0],
+                hi: self.range[1],
+            },
+            BaselineKind::TwoPoint => Baseline::TwoPoint {
+                x1: self.points[0],
+                x2: self.points[1],
+            },
+        }
+    }
+
+    fn normalize(&self) -> Normalize {
+        match self.normalize_kind {
+            NormalizeKind::None => Normalize::None,
+            NormalizeKind::Max => Normalize::Max,
+            NormalizeKind::AtX => Normalize::AtX(self.norm_x),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct CurveState {
+    visible: bool,
+    /// Manually picked colour; `None` follows the file's [`ColorMode`].
+    color: Option<Color32>,
+}
+
+impl Default for CurveState {
+    fn default() -> Self {
+        Self {
+            visible: true,
+            color: None,
+        }
+    }
+}
+
+/// One opened file. Only the path and display settings are persisted; the
+/// data is re-read from disk on startup.
+#[derive(Serialize, Deserialize)]
+struct LoadedFile {
+    path: PathBuf,
+    visible: bool,
+    color_mode: ColorMode,
+    curves: Vec<CurveState>,
+
+    #[serde(skip)]
+    dataset: Dataset,
+    /// Gradient position of each curve, derived from the dataset.
+    #[serde(skip)]
+    gradient: Vec<f32>,
+}
+
+impl LoadedFile {
+    fn new(dataset: Dataset, file_index: usize) -> Self {
+        let color_mode = if dataset.is_multi() {
+            ColorMode::Gradient(Colormap::Coolwarm)
+        } else {
+            ColorMode::Single(color::palette(file_index))
+        };
+        let mut file = Self {
+            path: dataset.path.clone(),
+            visible: true,
+            color_mode,
+            curves: Vec::new(),
+            dataset: Dataset::default(),
+            gradient: Vec::new(),
+        };
+        file.attach(dataset);
+        file
+    }
+
+    /// Installs freshly loaded data, keeping the curve settings when they
+    /// still match the file's layout.
+    fn attach(&mut self, dataset: Dataset) {
+        if self.curves.len() != dataset.curves.len() {
+            self.curves = vec![CurveState::default(); dataset.curves.len()];
+        }
+        self.gradient = color::gradient_positions(dataset.curves.iter().map(|c| c.label.as_str()));
+        self.dataset = dataset;
+    }
+
+    fn curve_color(&self, index: usize) -> Color32 {
+        self.curves[index]
+            .color
+            .unwrap_or_else(|| color::curve_color(self.color_mode, self.gradient[index]))
+    }
+}
+
+/// Persisted application state.
 #[derive(Serialize, Deserialize)]
 #[serde(default)]
-pub struct TemplateApp {
-    label: String,
-    value: f32,
-    counter: i64,
+pub struct UvViewerApp {
+    files: Vec<LoadedFile>,
+    processing: Processing,
+    show_legend: bool,
 
-    /// Transient UI state — recomputed each launch rather than persisted.
+    #[serde(skip)]
+    errors: Vec<String>,
     #[serde(skip)]
     show_about: bool,
 }
 
-impl Default for TemplateApp {
+impl Default for UvViewerApp {
     fn default() -> Self {
         Self {
-            label: "Hello, egui!".to_owned(),
-            value: 2.7,
-            counter: 0,
+            files: Vec::new(),
+            processing: Processing::default(),
+            show_legend: true,
+            errors: Vec::new(),
             show_about: false,
         }
     }
 }
 
-impl TemplateApp {
+impl UvViewerApp {
     /// Builds the app, restoring persisted state when eframe has some.
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
-        // Slightly roomier than the default; tweak to taste.
         cc.egui_ctx.set_pixels_per_point(1.1);
 
-        if let Some(storage) = cc.storage {
-            return eframe::get_value(storage, eframe::APP_KEY).unwrap_or_default();
+        let mut app: Self = cc
+            .storage
+            .and_then(|storage| eframe::get_value(storage, eframe::APP_KEY))
+            .unwrap_or_default();
+        app.reload_files();
+        app
+    }
+
+    /// Re-reads every persisted file from disk, dropping the ones that are gone.
+    fn reload_files(&mut self) {
+        let mut errors = Vec::new();
+        self.files.retain_mut(|file| match jasco::load(&file.path) {
+            Ok(dataset) => {
+                file.attach(dataset);
+                true
+            }
+            Err(e) => {
+                errors.push(e);
+                false
+            }
+        });
+        self.errors = errors;
+    }
+
+    fn open_paths(&mut self, paths: impl IntoIterator<Item = PathBuf>) {
+        for path in paths {
+            if self.files.iter().any(|f| f.path == path) {
+                continue;
+            }
+            match jasco::load(&path) {
+                Ok(dataset) => {
+                    let index = self.files.len();
+                    self.files.push(LoadedFile::new(dataset, index));
+                }
+                Err(e) => self.errors.push(e),
+            }
         }
-        Self::default()
     }
 
-    /// Increment the counter. Split out from the UI so it can be tested.
-    fn increment(&mut self) {
-        self.counter = self.counter.saturating_add(1);
+    fn open_dialog(&mut self) {
+        if let Some(paths) = rfd::FileDialog::new()
+            .add_filter("JASCO text", &["txt"])
+            .add_filter("All files", &["*"])
+            .pick_files()
+        {
+            self.open_paths(paths);
+        }
     }
 
-    fn reset(&mut self) {
-        *self = Self::default();
+    fn handle_dropped_files(&mut self, ctx: &egui::Context) {
+        let dropped: Vec<PathBuf> = ctx.input(|i| {
+            i.raw
+                .dropped_files
+                .iter()
+                .filter_map(|f| f.path.clone())
+                .collect()
+        });
+        if !dropped.is_empty() {
+            self.open_paths(dropped);
+        }
+    }
+
+    fn processing_ui(&mut self, ui: &mut egui::Ui) {
+        let p = &mut self.processing;
+
+        ui.label(RichText::new("Baseline").strong());
+        ui.radio_value(&mut p.baseline_kind, BaselineKind::None, "None");
+        ui.horizontal(|ui| {
+            ui.radio_value(&mut p.baseline_kind, BaselineKind::RangeMean, "Range mean");
+            ui.add_enabled_ui(p.baseline_kind == BaselineKind::RangeMean, |ui| {
+                x_value(ui, &mut p.range[0]);
+                ui.label("–");
+                x_value(ui, &mut p.range[1]);
+            });
+        });
+        ui.horizontal(|ui| {
+            ui.radio_value(&mut p.baseline_kind, BaselineKind::TwoPoint, "Two-point");
+            ui.add_enabled_ui(p.baseline_kind == BaselineKind::TwoPoint, |ui| {
+                x_value(ui, &mut p.points[0]);
+                ui.label("/");
+                x_value(ui, &mut p.points[1]);
+            });
+        });
+
+        ui.add_space(6.0);
+        ui.label(RichText::new("Normalize").strong());
+        ui.radio_value(&mut p.normalize_kind, NormalizeKind::None, "None");
+        ui.radio_value(&mut p.normalize_kind, NormalizeKind::Max, "Max = 1");
+        ui.horizontal(|ui| {
+            ui.radio_value(&mut p.normalize_kind, NormalizeKind::AtX, "Value at x = 1");
+            ui.add_enabled_ui(p.normalize_kind == NormalizeKind::AtX, |ui| {
+                x_value(ui, &mut p.norm_x);
+            });
+        });
+    }
+
+    fn files_ui(&mut self, ui: &mut egui::Ui) {
+        let mut remove = None;
+        for (fi, file) in self.files.iter_mut().enumerate() {
+            let id = ui.make_persistent_id(("file", &file.path));
+            egui::collapsing_header::CollapsingState::load_with_default_open(ui.ctx(), id, false)
+                .show_header(ui, |ui| {
+                    ui.checkbox(&mut file.visible, "");
+                    ui.label(&file.dataset.name)
+                        .on_hover_text(file.path.display().to_string());
+                    if ui.small_button("✖").on_hover_text("Close file").clicked() {
+                        remove = Some(fi);
+                    }
+                })
+                .body(|ui| file_body_ui(ui, file));
+        }
+        if let Some(i) = remove {
+            self.files.remove(i);
+        }
+    }
+
+    fn plot_ui(&self, ui: &mut egui::Ui) {
+        if self.files.is_empty() {
+            ui.centered_and_justified(|ui| {
+                ui.label("File → Open… or drop JASCO .txt files here");
+            });
+            return;
+        }
+
+        let baseline = self.processing.baseline();
+        let normalize = self.processing.normalize();
+        let first = self
+            .files
+            .iter()
+            .find(|f| f.visible)
+            .unwrap_or(&self.files[0]);
+        let x_label = axis_label(&first.dataset.x_unit);
+        let y_label = if normalize == Normalize::None {
+            axis_label(&first.dataset.y_unit)
+        } else {
+            "Normalized".to_owned()
+        };
+
+        let mut plot = Plot::new("spectra")
+            .x_axis_label(x_label)
+            .y_axis_label(y_label);
+        if self.show_legend {
+            plot = plot.legend(Legend::default());
+        }
+        plot.show(ui, |plot_ui| {
+            for (fi, file) in self.files.iter().enumerate().filter(|(_, f)| f.visible) {
+                for (ci, curve) in file.dataset.curves.iter().enumerate() {
+                    if !file.curves[ci].visible {
+                        continue;
+                    }
+                    let name = if file.dataset.is_multi() {
+                        format!("{}: {}", file.dataset.name, curve.label)
+                    } else {
+                        file.dataset.name.clone()
+                    };
+                    let points = processing::apply(curve, &baseline, &normalize);
+                    plot_ui.line(
+                        Line::new(name, points)
+                            .id(egui::Id::new(("curve", fi, ci)))
+                            .color(file.curve_color(ci))
+                            .width(1.5),
+                    );
+                }
+            }
+        });
     }
 }
 
-impl eframe::App for TemplateApp {
+fn file_body_ui(ui: &mut egui::Ui, file: &mut LoadedFile) {
+    ui.horizontal(|ui| {
+        let gradient = matches!(file.color_mode, ColorMode::Gradient(_));
+        if ui.selectable_label(gradient, "Gradient").clicked() && !gradient {
+            file.color_mode = ColorMode::Gradient(Colormap::Coolwarm);
+        }
+        if ui.selectable_label(!gradient, "Single").clicked() && gradient {
+            file.color_mode = ColorMode::Single(file.curve_color(0));
+        }
+        match &mut file.color_mode {
+            ColorMode::Gradient(map) => {
+                egui::ComboBox::from_id_salt(("colormap", &file.path))
+                    .selected_text(map.name())
+                    .show_ui(ui, |ui| {
+                        for m in Colormap::ALL {
+                            ui.selectable_value(map, m, m.name());
+                        }
+                    });
+            }
+            ColorMode::Single(c) => {
+                ui.color_edit_button_srgba(c);
+            }
+        }
+    });
+
+    ui.horizontal(|ui| {
+        if ui.small_button("Show all").clicked() {
+            file.curves.iter_mut().for_each(|c| c.visible = true);
+        }
+        if ui.small_button("Hide all").clicked() {
+            file.curves.iter_mut().for_each(|c| c.visible = false);
+        }
+        if file.curves.iter().any(|c| c.color.is_some())
+            && ui.small_button("Reset colors").clicked()
+        {
+            file.curves.iter_mut().for_each(|c| c.color = None);
+        }
+    });
+
+    for ci in 0..file.curves.len() {
+        let mut color = file.curve_color(ci);
+        let label = file.dataset.curves[ci].label.clone();
+        let state = &mut file.curves[ci];
+        ui.horizontal(|ui| {
+            if ui.color_edit_button_srgba(&mut color).changed() {
+                state.color = Some(color);
+            }
+            ui.checkbox(&mut state.visible, label);
+            if state.color.is_some() && ui.small_button("↺").on_hover_text("Reset color").clicked()
+            {
+                state.color = None;
+            }
+        });
+    }
+}
+
+/// A compact drag box for an x-axis position (wavelength or temperature).
+fn x_value(ui: &mut egui::Ui, value: &mut f64) {
+    ui.add(egui::DragValue::new(value).speed(0.5).max_decimals(2));
+}
+
+/// Turns the JASCO unit strings into axis titles.
+fn axis_label(unit: &str) -> String {
+    match unit {
+        "NANOMETERS" => "Wavelength / nm".to_owned(),
+        "ABSORBANCE" => "Absorbance".to_owned(),
+        u if u.starts_with("Temperature") => "Temperature / °C".to_owned(),
+        u => u.to_owned(),
+    }
+}
+
+impl eframe::App for UvViewerApp {
     /// Called by eframe on a timer and at shutdown (needs the `persistence` feature).
     fn save(&mut self, storage: &mut dyn eframe::Storage) {
         eframe::set_value(storage, eframe::APP_KEY, self);
@@ -67,12 +424,17 @@ impl eframe::App for TemplateApp {
         // Cloning a Context is cheap (it is an Arc) and frees up `ui` for the
         // panels below, since `egui::Window` still wants a `&Context`.
         let ctx = ui.ctx().clone();
+        self.handle_dropped_files(&ctx);
 
         egui::Panel::top("menu_bar").show(ui, |ui| {
             egui::MenuBar::new().ui(ui, |ui| {
                 ui.menu_button("File", |ui| {
-                    if ui.button("Reset state").clicked() {
-                        self.reset();
+                    if ui.button("Open…").clicked() {
+                        ui.close();
+                        self.open_dialog();
+                    }
+                    if ui.button("Close all").clicked() {
+                        self.files.clear();
                         ui.close();
                     }
                     ui.separator();
@@ -94,39 +456,37 @@ impl eframe::App for TemplateApp {
             });
         });
 
-        egui::Panel::left("side_panel").show(ui, |ui| {
-            ui.heading("Controls");
-            ui.separator();
+        egui::Panel::left("side_panel")
+            .resizable(true)
+            .default_size(320.0)
+            .show(ui, |ui| {
+                egui::ScrollArea::vertical().show(ui, |ui| {
+                    ui.heading("Processing");
+                    self.processing_ui(ui);
 
-            ui.horizontal(|ui| {
-                ui.label("Label:");
-                ui.text_edit_singleline(&mut self.label);
-            });
+                    ui.separator();
+                    ui.horizontal(|ui| {
+                        ui.heading("Files");
+                        if ui.button("Open…").clicked() {
+                            self.open_dialog();
+                        }
+                    });
+                    ui.checkbox(&mut self.show_legend, "Show legend");
+                    self.files_ui(ui);
 
-            ui.add(egui::Slider::new(&mut self.value, 0.0..=10.0).text("value"));
-
-            if ui.button("Increment").clicked() {
-                self.increment();
-            }
-            ui.label(format!("Counter: {}", self.counter));
-
-            ui.with_layout(egui::Layout::bottom_up(egui::Align::LEFT), |ui| {
-                ui.horizontal(|ui| {
-                    ui.spacing_mut().item_spacing.x = 0.0;
-                    ui.label("powered by ");
-                    ui.hyperlink_to("egui", "https://github.com/emilk/egui");
+                    if !self.errors.is_empty() {
+                        ui.separator();
+                        for e in &self.errors {
+                            ui.colored_label(ui.visuals().error_fg_color, e);
+                        }
+                        if ui.small_button("Dismiss").clicked() {
+                            self.errors.clear();
+                        }
+                    }
                 });
             });
-        });
 
-        egui::CentralPanel::default().show(ui, |ui| {
-            ui.heading(crate::APP_NAME);
-            ui.separator();
-            ui.label(&self.label);
-            ui.label(format!("value = {:.2}", self.value));
-            ui.separator();
-            ui.label("Edit src/app.rs to start building your app.");
-        });
+        egui::CentralPanel::default().show(ui, |ui| self.plot_ui(ui));
 
         if self.show_about {
             let mut open = self.show_about;
@@ -139,8 +499,7 @@ impl eframe::App for TemplateApp {
                     ui.heading(crate::APP_NAME);
                     ui.label(format!("Version {}", env!("CARGO_PKG_VERSION")));
                     ui.separator();
-                    ui.label(env!("CARGO_PKG_DESCRIPTION"));
-                    ui.hyperlink(env!("CARGO_PKG_REPOSITORY"));
+                    ui.label("Viewer for JASCO UV-Vis text exports.");
                 });
             self.show_about = open;
         }
@@ -150,55 +509,54 @@ impl eframe::App for TemplateApp {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::Path;
 
-    #[test]
-    fn increment_advances_the_counter() {
-        let mut app = TemplateApp::default();
-        assert_eq!(app.counter, 0);
-        app.increment();
-        app.increment();
-        assert_eq!(app.counter, 2);
+    fn testdata(name: &str) -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("testdata")
+            .join(name)
     }
 
     #[test]
-    fn increment_saturates_instead_of_overflowing() {
-        let mut app = TemplateApp {
-            counter: i64::MAX,
-            ..Default::default()
-        };
-        app.increment();
-        assert_eq!(app.counter, i64::MAX);
+    fn opening_the_same_file_twice_is_ignored() {
+        let mut app = UvViewerApp::default();
+        let path = testdata("20231122_QuinNaphtTDP_10microM_MCH.txt");
+        app.open_paths([path.clone(), path]);
+        assert_eq!(app.files.len(), 1);
+        assert_eq!(app.files[0].curves.len(), 19);
+        assert!(matches!(app.files[0].color_mode, ColorMode::Gradient(_)));
     }
 
     #[test]
-    fn reset_restores_defaults() {
-        let mut app = TemplateApp {
-            label: "changed".to_owned(),
-            ..Default::default()
-        };
-        app.increment();
-        app.reset();
-        assert_eq!(app.counter, 0);
-        assert_eq!(app.label, TemplateApp::default().label);
+    fn missing_files_are_reported() {
+        let mut app = UvViewerApp::default();
+        app.open_paths([testdata("does_not_exist.txt")]);
+        assert!(app.files.is_empty());
+        assert_eq!(app.errors.len(), 1);
     }
 
-    /// Guards the persistence contract: state must survive a serialize round-trip,
-    /// which is what eframe does between launches.
+    /// Guards the persistence contract: settings survive a serialize round-trip
+    /// and the data is re-read from the stored paths.
     #[test]
     fn state_survives_a_serde_round_trip() {
-        let app = TemplateApp {
-            label: "persisted".to_owned(),
-            value: 4.5,
-            counter: 7,
-            show_about: true,
-        };
+        let mut app = UvViewerApp::default();
+        app.open_paths([
+            testdata("20231122_QuinNaphtTDP_10microM_MCH.txt"),
+            testdata("20240530_QuinNaphTDP_100microM_CHCl3_1mm.txt"),
+        ]);
+        app.processing.baseline_kind = BaselineKind::TwoPoint;
+        app.files[0].curves[3].visible = false;
+        app.files[0].curves[4].color = Some(Color32::RED);
 
         let json = serde_json::to_string(&app).expect("serialize");
-        let restored: TemplateApp = serde_json::from_str(&json).expect("deserialize");
+        let mut restored: UvViewerApp = serde_json::from_str(&json).expect("deserialize");
+        restored.reload_files();
 
-        assert_eq!(restored.label, "persisted");
-        assert_eq!(restored.counter, 7);
-        // `show_about` is #[serde(skip)], so it comes back at its default.
-        assert!(!restored.show_about);
+        assert_eq!(restored.processing, app.processing);
+        assert_eq!(restored.files.len(), 2);
+        assert_eq!(restored.files[0].dataset.curves.len(), 19);
+        assert!(!restored.files[0].curves[3].visible);
+        assert_eq!(restored.files[0].curve_color(4), Color32::RED);
+        assert!(restored.errors.is_empty());
     }
 }

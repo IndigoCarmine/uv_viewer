@@ -2,7 +2,7 @@
 // `println!`/panics stay visible while developing.
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
-use egui_template::{APP_NAME, TemplateApp};
+use egui_template::{APP_NAME, UvViewerApp};
 
 /// The window/taskbar icon, embedded at compile time — the source tree is not
 /// present on an end user's machine, so it cannot be loaded from disk.
@@ -38,6 +38,6 @@ fn main() -> eframe::Result<()> {
     eframe::run_native(
         APP_NAME,
         options,
-        Box::new(|cc| Ok(Box::new(TemplateApp::new(cc)))),
+        Box::new(|cc| Ok(Box::new(UvViewerApp::new(cc)))),
     )
 }
