@@ -142,6 +142,9 @@ impl LoadedFile {
     }
 }
 
+/// Drag-and-drop payload for reordering the file list: the dragged file's index.
+struct FileDrag(usize);
+
 /// Persisted application state.
 #[derive(Serialize, Deserialize)]
 #[serde(default)]
@@ -269,23 +272,68 @@ impl UvViewerApp {
         });
     }
 
+    /// Moves the file at `from` so that it lands before the file currently at
+    /// `to` (`to == len` moves it to the end).
+    fn move_file(&mut self, from: usize, to: usize) {
+        let file = self.files.remove(from);
+        self.files.insert(if to > from { to - 1 } else { to }, file);
+    }
+
     fn files_ui(&mut self, ui: &mut egui::Ui) {
         let mut remove = None;
+        let dragged = egui::DragAndDrop::payload::<FileDrag>(ui.ctx()).map(|p| p.0);
+        let pointer = ui.ctx().pointer_interact_pos();
+        let mut drop_to = None;
         for (fi, file) in self.files.iter_mut().enumerate() {
             let id = ui.make_persistent_id(("file", &file.path));
-            egui::collapsing_header::CollapsingState::load_with_default_open(ui.ctx(), id, false)
-                .show_header(ui, |ui| {
-                    ui.checkbox(&mut file.visible, "");
-                    ui.label(&file.dataset.name)
-                        .on_hover_text(file.path.display().to_string());
-                    if ui.small_button("✖").on_hover_text("Close file").clicked() {
-                        remove = Some(fi);
-                    }
+            let rect = ui
+                .scope(|ui| {
+                    egui::collapsing_header::CollapsingState::load_with_default_open(
+                        ui.ctx(),
+                        id,
+                        false,
+                    )
+                    .show_header(ui, |ui| {
+                        ui.add(
+                            egui::Label::new("☰")
+                                .selectable(false)
+                                .sense(egui::Sense::drag()),
+                        )
+                        .on_hover_text("Drag to reorder")
+                        .dnd_set_drag_payload(FileDrag(fi));
+                        ui.checkbox(&mut file.visible, "");
+                        ui.label(&file.dataset.name)
+                            .on_hover_text(file.path.display().to_string());
+                        if ui.small_button("✖").on_hover_text("Close file").clicked() {
+                            remove = Some(fi);
+                        }
+                    })
+                    .body(|ui| file_body_ui(ui, file));
                 })
-                .body(|ui| file_body_ui(ui, file));
+                .response
+                .rect;
+
+            // While dragging, mark the drop position above or below this file.
+            if dragged.is_some()
+                && let Some(pos) = pointer
+            {
+                let rect = rect.expand2(egui::vec2(0.0, ui.spacing().item_spacing.y / 2.0));
+                if rect.contains(pos) {
+                    let below = pos.y > rect.center().y;
+                    let y = if below { rect.bottom() } else { rect.top() };
+                    ui.painter()
+                        .hline(rect.x_range(), y, ui.visuals().selection.stroke);
+                    drop_to = Some(fi + usize::from(below));
+                }
+            }
         }
         if let Some(i) = remove {
             self.files.remove(i);
+        } else if let (Some(from), Some(to)) = (dragged, drop_to)
+            && ui.input(|i| i.pointer.any_released())
+        {
+            egui::DragAndDrop::clear_payload(ui.ctx());
+            self.move_file(from, to);
         }
     }
 
@@ -318,7 +366,7 @@ impl UvViewerApp {
             plot = plot.legend(Legend::default());
         }
         plot.show(ui, |plot_ui| {
-            for (fi, file) in self.files.iter().enumerate().filter(|(_, f)| f.visible) {
+            for file in self.files.iter().filter(|f| f.visible) {
                 for (ci, curve) in file.dataset.curves.iter().enumerate() {
                     if !file.curves[ci].visible {
                         continue;
@@ -331,7 +379,8 @@ impl UvViewerApp {
                     let points = processing::apply(curve, &baseline, &normalize);
                     plot_ui.line(
                         Line::new(name, points)
-                            .id(egui::Id::new(("curve", fi, ci)))
+                            // Keyed by path so legend-hidden curves survive a reorder.
+                            .id(egui::Id::new(("curve", &file.path, ci)))
                             .color(file.curve_color(ci))
                             .width(1.5),
                     );
@@ -525,6 +574,34 @@ mod tests {
         assert_eq!(app.files.len(), 1);
         assert_eq!(app.files[0].curves.len(), 19);
         assert!(matches!(app.files[0].color_mode, ColorMode::Gradient(_)));
+    }
+
+    #[test]
+    fn move_file_reorders_without_touching_colors() {
+        let names = [
+            "20231122_QuinNaphtTDP_10microM_MCH.txt",
+            "20240530_QuinNaphTDP_100microM_CHCl3_1mm.txt",
+        ];
+        let mut app = UvViewerApp::default();
+        app.open_paths(names.map(testdata));
+        let order =
+            |app: &UvViewerApp| app.files.iter().map(|f| f.path.clone()).collect::<Vec<_>>();
+        let colors = |app: &UvViewerApp| {
+            app.files
+                .iter()
+                .map(|f| (f.path.clone(), f.curve_color(0)))
+                .collect::<Vec<_>>()
+        };
+        let before = colors(&app);
+
+        app.move_file(0, 2);
+        assert_eq!(order(&app), [testdata(names[1]), testdata(names[0])]);
+        app.move_file(1, 0);
+        assert_eq!(order(&app), [testdata(names[0]), testdata(names[1])]);
+        // Dropping a file right above or below itself is a no-op.
+        app.move_file(0, 0);
+        app.move_file(0, 1);
+        assert_eq!(colors(&app), before);
     }
 
     #[test]
