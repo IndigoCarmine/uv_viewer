@@ -8,6 +8,7 @@
 //!
 //! The layout follows the real exports: a `KEY\tVALUE` header in the same key
 //! order, `XYDATA`, the data, CRLF line endings and CP932 (Shift-JIS) encoding.
+//! Some real exports use LF line endings instead; `lf_only.txt` covers those.
 //!
 //! - Regenerate: `cargo test -- --ignored regenerate_fixtures`
 //! - `committed_fixtures_match_generator` fails when `testdata/` is stale.
@@ -85,6 +86,53 @@ pub(crate) mod temperature {
     }
 }
 
+/// Transmittance at one wavelength against time in seconds.
+pub(crate) mod time_course {
+    pub(crate) const FILE: &str = "time_course.txt";
+    const STEP_SEC: i64 = 30;
+    pub(crate) const NPOINTS: usize = 61;
+
+    pub(crate) fn x(i: usize) -> f64 {
+        (STEP_SEC * i as i64) as f64
+    }
+
+    /// Percent transmittance relaxing from 80 % towards 20 %.
+    pub(crate) fn y(i: usize) -> f64 {
+        20.0 + 60.0 * 300.0 / (300.0 + x(i)) + 0.05 * super::noise(11, i)
+    }
+}
+
+/// Multi column spectra whose header carries CP932 text (including `表` and
+/// `ソ`, whose second byte is 0x5C) and whose Extended section starts on the
+/// line right after the data, with no blank line in between.
+pub(crate) mod cp932_header {
+    pub(crate) const FILE: &str = "cp932_header.txt";
+    pub(crate) const TITLE: &str = "合成データ：表示ソフト試験";
+    pub(crate) const LABELS: [&str; 4] = ["20", "35", "50", "65"];
+    const FIRST_X: i64 = 350;
+    const STEP: i64 = -2;
+    pub(crate) const NPOINTS: usize = 41;
+    /// X of the numeric rows inside the Extended section. They would parse as
+    /// data points if reading did not stop at `#####`.
+    pub(crate) const EXTENDED_X: [f64; 2] = [600.0, 601.0];
+    pub(crate) const EXTENDED_Y: f64 = 5.0;
+
+    pub(crate) fn x(i: usize) -> f64 {
+        (FIRST_X + STEP * i as i64) as f64
+    }
+
+    pub(crate) fn y(k: usize, i: usize) -> f64 {
+        let x = x(i);
+        let k = k as f64;
+        super::band(x, 310.0, 14.0, 0.8 - 0.1 * k) + 0.001 * super::noise(12 + k as u64, i)
+    }
+}
+
+/// `single_spectrum.txt` with LF instead of CRLF line endings.
+pub(crate) mod lf_only {
+    pub(crate) const FILE: &str = "lf_only.txt";
+}
+
 /// A squared Lorentzian: peaks at `amplitude` on `center`, falls off quickly.
 fn band(x: f64, center: f64, width: f64, amplitude: f64) -> f64 {
     let d = x - center;
@@ -143,10 +191,15 @@ fn fmt_npoints(n: usize) -> String {
 
 /// Joins lines with CRLF (including after the last one) and encodes as CP932.
 fn encode(lines: &[String]) -> Vec<u8> {
+    encode_with(lines, "\r\n")
+}
+
+/// Joins lines with `eol` (including after the last one) and encodes as CP932.
+fn encode_with(lines: &[String], eol: &str) -> Vec<u8> {
     let mut text = String::new();
     for line in lines {
         text.push_str(line);
-        text.push_str("\r\n");
+        text.push_str(eol);
     }
     let (bytes, _, had_errors) = encoding_rs::SHIFT_JIS.encode(&text);
     assert!(!had_errors, "fixture text is not representable in CP932");
@@ -164,6 +217,14 @@ fn extremes(values: &[f64]) -> (f64, f64) {
 }
 
 fn single_spectrum() -> Vec<u8> {
+    encode(&single_spectrum_lines())
+}
+
+fn lf_only() -> Vec<u8> {
+    encode_with(&single_spectrum_lines(), "\n")
+}
+
+fn single_spectrum_lines() -> Vec<String> {
     use single::*;
     let ys: Vec<f64> = (0..NPOINTS).map(y).collect();
     let (max, min) = extremes(&ys);
@@ -217,7 +278,7 @@ fn single_spectrum() -> Vec<u8> {
         ]
         .map(String::from),
     );
-    encode(&lines)
+    lines
 }
 
 fn multi_spectra() -> Vec<u8> {
@@ -306,12 +367,111 @@ fn temperature_scan() -> Vec<u8> {
     encode(&lines)
 }
 
+fn time_course_scan() -> Vec<u8> {
+    use time_course::*;
+    let ys: Vec<f64> = (0..NPOINTS).map(y).collect();
+    let (max, min) = extremes(&ys);
+    let mut lines = header(&[
+        ("TITLE", String::new()),
+        ("DATA TYPE", "ULTRAVIOLET SPECTRUM".into()),
+        ("ORIGIN", "JASCO".into()),
+        ("OWNER", String::new()),
+        ("DATE", "04/05/06".into()),
+        ("TIME", "07:08:09".into()),
+        ("SPECTROMETER/DATA SYSTEM", String::new()),
+        ("LOCALE", "1041".into()),
+        ("RESOLUTION", String::new()),
+        ("DELTAX", "30".into()),
+        ("XUNITS", "SEC".into()),
+        ("YUNITS", "TRANSMITTANCE".into()),
+        ("FIRSTX", fmt_header_x(x(0))),
+        ("LASTX", fmt_header_x(x(NPOINTS - 1))),
+        ("NPOINTS", fmt_npoints(NPOINTS)),
+        ("FIRSTY", fmt_header_y(ys[0])),
+        ("MAXY", fmt_header_y(max)),
+        ("MINY", fmt_header_y(min)),
+    ]);
+    lines.push("XYDATA".into());
+    lines.extend((0..NPOINTS).map(|i| format!("{:.4}\t{}", x(i), fmt_g(ys[i]))));
+    encode(&lines)
+}
+
+fn cp932_header_spectra() -> Vec<u8> {
+    use cp932_header::*;
+    let ys: Vec<Vec<f64>> = (0..LABELS.len())
+        .map(|k| (0..NPOINTS).map(|i| y(k, i)).collect())
+        .collect();
+    let all: Vec<f64> = ys.iter().flatten().copied().collect();
+    let (max, min) = extremes(&all);
+    let mut lines = header(&[
+        ("TITLE", TITLE.into()),
+        ("DATA TYPE", "ULTRAVIOLET SPECTRUM".into()),
+        ("ORIGIN", "JASCO".into()),
+        ("OWNER", "試験担当（架空）".into()),
+        ("DATE", "05/06/07".into()),
+        ("TIME", "08:09:10".into()),
+        ("SPECTROMETER/DATA SYSTEM", "架空分光器／ソフト".into()),
+        ("LOCALE", "1041".into()),
+        ("RESOLUTION", String::new()),
+        ("DELTAX", "-2".into()),
+        ("XUNITS", "NANOMETERS".into()),
+        ("YUNITS", "ABSORBANCE".into()),
+        ("FIRSTX", fmt_header_x(x(0))),
+        ("LASTX", fmt_header_x(x(NPOINTS - 1))),
+        ("NPOINTS", fmt_npoints(NPOINTS)),
+        ("FIRSTY", fmt_header_y(ys[0][0])),
+        ("MAXY", fmt_header_y(max)),
+        ("MINY", fmt_header_y(min)),
+    ]);
+    lines.push("XYDATA".into());
+    lines.push(format!("\t{}", LABELS.join("\t")));
+    for i in 0..NPOINTS {
+        let mut line = fmt_g(x(i));
+        for column in &ys {
+            line.push('\t');
+            line.push_str(&fmt_g(column[i]));
+        }
+        lines.push(line);
+    }
+    lines.extend(
+        [
+            "##### Extended Information",
+            "[コメント情報]",
+            "試料名\t合成試料その三",
+            "[補正データ]",
+        ]
+        .map(String::from),
+    );
+    for x in EXTENDED_X {
+        let mut line = fmt_g(x);
+        for _ in LABELS {
+            line.push('\t');
+            line.push_str(&fmt_g(EXTENDED_Y));
+        }
+        lines.push(line);
+    }
+    lines.extend(
+        [
+            "",
+            "[測定情報]",
+            "装置名\t架空分光器",
+            "  セル\t石英 ±0 mm",
+            "",
+        ]
+        .map(String::from),
+    );
+    encode(&lines)
+}
+
 /// Every fixture as `(file name, bytes)`.
 pub(crate) fn generate() -> Vec<(&'static str, Vec<u8>)> {
     vec![
         (single::FILE, single_spectrum()),
         (multi::FILE, multi_spectra()),
         (temperature::FILE, temperature_scan()),
+        (time_course::FILE, time_course_scan()),
+        (cp932_header::FILE, cp932_header_spectra()),
+        (lf_only::FILE, lf_only()),
     ]
 }
 
