@@ -1,6 +1,6 @@
 /target
 /dist
-
+/tests
 # Release-workflow scratch output (also produced when building installers locally)
 /out
 /AppDir
