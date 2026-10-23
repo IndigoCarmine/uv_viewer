@@ -1,8 +1,10 @@
-# egui Template
+# UV Viewer
 
 [日本語版 README](README_ja.md)
 
-A starting point for cross-platform desktop apps built with [egui](https://github.com/emilk/egui) / [eframe](https://github.com/emilk/egui/tree/master/crates/eframe).
+A desktop viewer for UV-Vis spectra exported as text from JASCO spectrometers (e.g. the V-760), built with [egui](https://github.com/emilk/egui) / [eframe](https://github.com/emilk/egui/tree/master/crates/eframe). Open several files, overlay their curves on one plot, apply a baseline correction and normalisation to all of them, and colour multi-scan files with a gradient.
+
+The project started from an egui template, and the crate, binary and release artifact names (`egui_template`, `egui-template-…`) have not been renamed yet.
 
 Push a `v*` tag and GitHub Actions builds and publishes **installers for Windows, macOS and Linux**.
 
@@ -16,9 +18,60 @@ Push a `v*` tag and GitHub Actions builds and publishes **installers for Windows
 | Linux | `egui-template_<version>_amd64.deb` | Debian/Ubuntu package |
 | Linux | `egui-template-<version>-linux-x86_64` | Portable binary |
 
+## Supported files
+
+The viewer reads the text export of JASCO spectrometers:
+
+- **Encoding** — CP932 (Shift-JIS).
+- **Header** — `KEY<TAB>VALUE` lines up to a line reading `XYDATA`. `XUNITS` and `YUNITS` become the axis titles (`NANOMETERS` → *Wavelength / nm*, `ABSORBANCE` → *Absorbance*, `Temperature…` → *Temperature / °C*; any other unit is shown as written). A file without an `XYDATA` line, or without any numeric data after it, is rejected with an error.
+- **Single column** — one `x<TAB>y` pair per line: one curve, named after the file.
+- **Multi column** — a row that starts with a tab and lists one label per scan (usually the temperature, e.g. `<TAB>110<TAB>104.99…`), followed by `x<TAB>y1<TAB>y2…` lines: one curve per column, named by its label.
+- The data ends at the first empty line or `#####` line, so a trailing `##### Extended Information` section is ignored.
+
+The x values can be wavelengths or anything else the instrument exports, such as temperatures in a single-wavelength temperature scan.
+
+## Using the viewer
+
+### Opening files
+
+- **File → Open…**, or the **Open…** button next to *Files* in the side panel, opens a file dialog (filter *JASCO text*, `*.txt`; several files can be selected at once).
+- Files can also be dropped onto the window.
+- A file that is already open is not opened a second time. Files that fail to load are reported as error messages at the bottom of the side panel until you click **Dismiss**.
+- **File → Close all** closes every file; the **✖** button in a file's row closes just that file.
+
+### Baseline and normalisation
+
+The *Processing* settings apply to every curve, baseline first, then normalisation:
+
+- **Baseline**
+  - **None**
+  - **Range mean** — subtracts the mean of the points whose x lies between the two values. If no point falls in the range, the value interpolated at the middle of the range is subtracted instead.
+  - **Two-point** — subtracts the straight line through the curve at the two x values.
+- **Normalize**
+  - **None**
+  - **Max = 1** — divides by the maximum of the (baseline-corrected) curve.
+  - **Value at x = 1** — divides by the curve's value at the given x.
+
+The curve's value at a *Two-point* or *Value at x* position is interpolated linearly, so the position does not have to match a data point. When a baseline or normalisation x lies outside a curve's x range, that step is skipped for that curve instead of hiding it, and normalisation is also skipped when the divisor is (almost) zero. While normalisation is on, the y axis is titled *Normalized*.
+
+### Files, curves and colours
+
+- Each file has a checkbox to show or hide all its curves, and a **☰** handle to drag it to a new position in the list.
+- Expanding a file shows its colour settings and one row per curve, with a visibility checkbox and a colour button. **Show all** / **Hide all** toggle every curve of the file.
+- Colour mode per file:
+  - **Gradient** — curves are coloured along a colormap: *Viridis*, *Jet*, *Coolwarm* or *Blue → Red*. When every curve label is a number (such as the scan temperatures of a multi-column file), a curve's position on the colormap follows that number, so the hottest scan always gets the top of the colormap whether the run was heated or cooled. Otherwise the curves are spread evenly in file order.
+  - **Single** — every curve of the file gets one colour.
+- Multi-column files start in *Gradient* mode with *Coolwarm*; single-curve files get a colour from an 8-colour palette, picked by how many files are already open.
+- Picking a colour for an individual curve overrides the file's colour mode; **↺** (or **Reset colors** for the whole file) goes back to the file's colours.
+- **Show legend** toggles the plot legend. The axis titles come from the first visible file.
+
+### Saved state
+
+The open files and the settings are saved by eframe's `persistence` feature and restored on the next start: the file paths and their order, file and curve visibility, colour modes and curve colours, the processing settings and the legend toggle. Only the paths are stored, not the data, so the files are re-read from disk on startup. A file that can no longer be read is removed from the list and reported as an error. A file's per-curve settings are kept as long as it still has the same number of curves; otherwise they are reset.
+
 ## What's in the box
 
-- **Persistent state** — window contents survive restarts via eframe's `persistence` feature.
+- **Persistent state** — the open files and settings survive restarts via eframe's `persistence` feature (see [Saved state](#saved-state)).
 - **Icons for every platform** — `resources/` holds `icon.png` (window + Linux), `icon.ico` (Windows `.exe`) and `icon.icns` (macOS bundle).
 - **Declarative macOS bundling** — `cargo bundle` generates `Info.plist` from `[package.metadata.bundle]`, so there is no plist to hand-maintain.
 - **Wayland drag-and-drop** — `[patch.crates-io]` pins `winit`/`egui-winit` forks that implement native DnD on Wayland (upstream does not).
@@ -34,7 +87,12 @@ Push a `v*` tag and GitHub Actions builds and publishes **installers for Windows
 cargo run
 ```
 
-Then edit [`src/app.rs`](src/app.rs) — the demo widgets there are meant to be deleted.
+The code is split by concern:
+
+- [`src/jasco.rs`](src/jasco.rs) — parser for the JASCO text export.
+- [`src/processing.rs`](src/processing.rs) — baseline correction and normalisation.
+- [`src/color.rs`](src/color.rs) — colormaps, the single-colour palette and gradient positions.
+- [`src/app.rs`](src/app.rs) — application state, user interface and persistence.
 
 ## Making it yours
 
