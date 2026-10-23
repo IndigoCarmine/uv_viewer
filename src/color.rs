@@ -64,7 +64,7 @@ pub enum ColorMode {
     Single(Color32),
 }
 
-/// Distinct colours handed out to files in load order.
+/// Distinct colours handed out to single-colour files by [`next_single`].
 const PALETTE: [Color32; 8] = [
     Color32::from_rgb(31, 119, 180),
     Color32::from_rgb(214, 39, 40),
@@ -78,6 +78,27 @@ const PALETTE: [Color32; 8] = [
 
 pub fn palette(index: usize) -> Color32 {
     PALETTE[index % PALETTE.len()]
+}
+
+/// Palette colour for a newly opened single-colour file, given the colours
+/// the open files already use.
+///
+/// Picks the palette colour used the fewest times, earliest in the palette on
+/// a tie: the first unused colour while any is left, and an even cycle once
+/// all are taken.
+pub fn next_single(in_use: impl IntoIterator<Item = Color32>) -> Color32 {
+    let mut counts = [0usize; PALETTE.len()];
+    for c in in_use {
+        if let Some(i) = PALETTE.iter().position(|&p| p == c) {
+            counts[i] += 1;
+        }
+    }
+    let (i, _) = counts
+        .iter()
+        .enumerate()
+        .min_by_key(|&(_, &n)| n)
+        .expect("palette is not empty");
+    PALETTE[i]
 }
 
 /// Where each curve sits on a gradient, in `0.0..=1.0`.
@@ -139,6 +160,26 @@ mod tests {
     fn text_labels_position_by_order() {
         let t = gradient_positions(["a", "b", "c"].into_iter());
         assert_eq!(t, vec![0.0, 0.5, 1.0]);
+    }
+
+    #[test]
+    fn next_single_takes_the_first_unused_colour() {
+        assert_eq!(next_single([]), PALETTE[0]);
+        assert_eq!(next_single([PALETTE[1], PALETTE[0]]), PALETTE[2]);
+        // A gap left by a closed file is filled first.
+        assert_eq!(next_single([PALETTE[1], PALETTE[2]]), PALETTE[0]);
+        // Colours outside the palette (picked by hand) do not take a slot.
+        assert_eq!(next_single([Color32::BLACK]), PALETTE[0]);
+    }
+
+    #[test]
+    fn next_single_cycles_evenly_once_all_are_used() {
+        let mut used = PALETTE.to_vec();
+        assert_eq!(next_single(used.clone()), PALETTE[0]);
+        used.push(PALETTE[0]);
+        assert_eq!(next_single(used.clone()), PALETTE[1]);
+        used.retain(|&c| c != PALETTE[5]);
+        assert_eq!(next_single(used), PALETTE[5]);
     }
 
     #[test]

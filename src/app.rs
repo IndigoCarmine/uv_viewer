@@ -107,11 +107,12 @@ struct LoadedFile {
 }
 
 impl LoadedFile {
-    fn new(dataset: Dataset, file_index: usize) -> Self {
+    /// `single_color` is the colour a single-curve file starts with.
+    fn new(dataset: Dataset, single_color: Color32) -> Self {
         let color_mode = if dataset.is_multi() {
             ColorMode::Gradient(Colormap::Coolwarm)
         } else {
-            ColorMode::Single(color::palette(file_index))
+            ColorMode::Single(single_color)
         };
         let mut file = Self {
             path: dataset.path.clone(),
@@ -212,8 +213,16 @@ impl UvViewerApp {
             }
             match jasco::load(&path) {
                 Ok(dataset) => {
-                    let index = self.files.len();
-                    self.files.push(LoadedFile::new(dataset, index));
+                    // Avoid the colours the open files already show, rather than
+                    // going by list position, which repeats after a close or move.
+                    // Once all palette colours are taken, they are reused evenly.
+                    // Per-curve overrides are deliberate picks and do not count.
+                    let in_use = self.files.iter().filter_map(|f| match f.color_mode {
+                        ColorMode::Single(c) => Some(c),
+                        ColorMode::Gradient(_) => None,
+                    });
+                    let single_color = color::next_single(in_use);
+                    self.files.push(LoadedFile::new(dataset, single_color));
                 }
                 Err(e) => self.errors.push(e),
             }
@@ -626,6 +635,79 @@ mod tests {
         app.move_file(0, 0);
         app.move_file(0, 1);
         assert_eq!(colors(&app), before);
+    }
+
+    /// Copies of a fixture in a per-test temporary directory, which is removed
+    /// when this guard is dropped (also when the test panics).
+    struct TempCopies {
+        dir: PathBuf,
+        paths: Vec<PathBuf>,
+    }
+
+    impl Drop for TempCopies {
+        fn drop(&mut self) {
+            // Best-effort cleanup: a leftover temp directory must not fail the test.
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    /// Copies the single-curve fixture to `count` distinct paths, since
+    /// opening the same path twice is ignored.
+    fn single_curve_copies(test: &str, count: usize) -> TempCopies {
+        let dir = std::env::temp_dir().join(format!("uv_viewer-{test}-{}", std::process::id()));
+        // Clear a leftover from an earlier run that had the same PID.
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        // Own the directory before copying, so a failed copy still cleans up.
+        let mut copies = TempCopies {
+            dir,
+            paths: Vec::new(),
+        };
+        for i in 0..count {
+            let path = copies.dir.join(format!("single_{i}.txt"));
+            std::fs::copy(testdata(fixtures::single::FILE), &path).expect("copy fixture");
+            copies.paths.push(path);
+        }
+        copies
+    }
+
+    fn single_colors(app: &UvViewerApp) -> Vec<Color32> {
+        app.files
+            .iter()
+            .map(|f| match f.color_mode {
+                ColorMode::Single(c) => c,
+                ColorMode::Gradient(_) => panic!("expected a single-curve file"),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn closing_a_file_does_not_hand_out_a_colour_in_use() {
+        let copies = single_curve_copies("close", 3);
+        let paths = &copies.paths;
+        let mut app = UvViewerApp::default();
+        app.open_paths(paths[..2].to_vec());
+        app.files.remove(0);
+        app.open_paths([paths[2].clone()]);
+
+        let colors = single_colors(&app);
+        assert_eq!(colors.len(), 2);
+        assert_ne!(colors[0], colors[1]);
+    }
+
+    #[test]
+    fn reordering_files_does_not_hand_out_a_colour_in_use() {
+        let copies = single_curve_copies("reorder", 3);
+        let paths = &copies.paths;
+        let mut app = UvViewerApp::default();
+        app.open_paths(paths[..2].to_vec());
+        app.move_file(1, 0);
+        app.files.remove(1);
+        app.open_paths([paths[2].clone()]);
+
+        let colors = single_colors(&app);
+        assert_eq!(colors.len(), 2);
+        assert_ne!(colors[0], colors[1]);
     }
 
     #[test]
