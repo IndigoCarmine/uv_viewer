@@ -1,17 +1,52 @@
 //! The application state and its per-frame update logic.
 
 use std::ffi::OsString;
+use std::ops::RangeInclusive;
 use std::path::{Path, PathBuf};
 
 use egui::{Color32, RichText};
-use egui_plot::{Legend, Line, Plot};
-use serde::{Deserialize, Serialize};
+use egui_plot::{Legend, Line, MarkerShape, Plot, Points};
+use serde::{Deserialize, Deserializer, Serialize};
 
 use crate::color::{self, ColorMode, Colormap};
 use crate::export;
 use crate::figure;
 use crate::jasco::{self, Dataset};
 use crate::processing::{self, Baseline, Normalize};
+use crate::trace;
+
+/// What the plot shows.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+enum PlotMode {
+    /// The shown curves, y against x.
+    #[default]
+    Spectra,
+    /// Per file, the value at [`UvViewerApp::trace_wavelength`] of each shown
+    /// curve against its column label (e.g. a melting curve).
+    Trace,
+}
+
+/// The trace wavelength of a fresh or older saved state.
+const DEFAULT_TRACE_WAVELENGTH: f64 = 400.0;
+
+/// Bounds of the trace wavelength box. Finite bounds make the box clamp a
+/// typed or restored NaN / infinity to a finite value; they are far wider
+/// than any x axis of a UV-Vis export.
+const TRACE_X_RANGE: RangeInclusive<f64> = -1.0e6..=1.0e6;
+
+/// Why the exports are disabled in the trace view.
+const TRACE_EXPORT_BLOCKER: &str = "Switch to Spectra to export";
+
+/// Reads a stored trace wavelength, replacing a non-finite one (which RON,
+/// eframe's storage format, can hold) by the default.
+fn finite_trace_wavelength<'de, D: Deserializer<'de>>(d: D) -> Result<f64, D::Error> {
+    let x = f64::deserialize(d)?;
+    Ok(if x.is_finite() {
+        x
+    } else {
+        DEFAULT_TRACE_WAVELENGTH
+    })
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 enum BaselineKind {
@@ -156,6 +191,10 @@ pub struct UvViewerApp {
     files: Vec<LoadedFile>,
     processing: Processing,
     show_legend: bool,
+    plot_mode: PlotMode,
+    /// The x value (wavelength) the trace view reads each curve at.
+    #[serde(deserialize_with = "finite_trace_wavelength")]
+    trace_wavelength: f64,
 
     #[serde(skip)]
     errors: Vec<String>,
@@ -169,6 +208,8 @@ impl Default for UvViewerApp {
             files: Vec::new(),
             processing: Processing::default(),
             show_legend: true,
+            plot_mode: PlotMode::Spectra,
+            trace_wavelength: DEFAULT_TRACE_WAVELENGTH,
             errors: Vec::new(),
             show_about: false,
         }
@@ -288,6 +329,19 @@ impl UvViewerApp {
         }
     }
 
+    fn view_ui(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            ui.selectable_value(&mut self.plot_mode, PlotMode::Spectra, "Spectra");
+            ui.selectable_value(&mut self.plot_mode, PlotMode::Trace, "Temperature trace");
+        });
+        ui.horizontal(|ui| {
+            ui.add_enabled_ui(self.plot_mode == PlotMode::Trace, |ui| {
+                ui.label("λ");
+                trace_x_value(ui, &mut self.trace_wavelength);
+            });
+        });
+    }
+
     fn processing_ui(&mut self, ui: &mut egui::Ui) {
         let p = &mut self.processing;
 
@@ -394,6 +448,10 @@ impl UvViewerApp {
             });
             return;
         }
+        if self.plot_mode == PlotMode::Trace {
+            self.trace_plot_ui(ui);
+            return;
+        }
 
         let Some((x_label, y_label)) = self.axis_titles() else {
             return;
@@ -416,6 +474,50 @@ impl UvViewerApp {
                 );
             }
         });
+    }
+
+    fn trace_plot_ui(&self, ui: &mut egui::Ui) {
+        let traces = self.visible_traces();
+        let mut plot = Plot::new("trace");
+        if let Some((x_label, y_label)) = self.trace_axis_titles(&traces) {
+            plot = plot.x_axis_label(x_label).y_axis_label(y_label);
+        }
+        if self.show_legend {
+            plot = plot.legend(Legend::default());
+        }
+        plot.show(ui, |plot_ui| {
+            for trace in traces {
+                // Line and markers share name and id, so they make one legend
+                // entry; keyed by path so a legend-hidden trace survives a reorder.
+                let id = egui::Id::new(("trace", trace.path));
+                plot_ui.line(
+                    Line::new(trace.name.clone(), trace.points.clone())
+                        .id(id)
+                        .color(trace.color)
+                        .width(1.5),
+                );
+                plot_ui.points(
+                    Points::new(trace.name, trace.points)
+                        .id(id)
+                        .color(trace.color)
+                        .shape(MarkerShape::Circle)
+                        .filled(true)
+                        .radius(3.0),
+                );
+            }
+        });
+    }
+
+    /// The trace view's axis titles, from the file of the first trace and the
+    /// trace wavelength; `None` when there is no trace.
+    fn trace_axis_titles(&self, traces: &[VisibleTrace<'_>]) -> Option<(String, String)> {
+        let first = traces.first()?.dataset;
+        let (_, y_title) = axis_titles(first, self.processing.normalize());
+        Some(trace::trace_axis_titles(
+            &first.x_unit,
+            &y_title,
+            self.trace_wavelength,
+        ))
     }
 
     /// The plot's x and y axis titles, taken from the file of the first shown
@@ -457,6 +559,9 @@ impl UvViewerApp {
     /// the menu item is disabled then, and an export with no columns would
     /// only be two empty lines.
     fn export_to(&mut self, path: &Path) {
+        if self.refuse_trace_export(path) {
+            return;
+        }
         let curves = self.export_curves();
         if curves.is_empty() {
             self.errors.push(format!(
@@ -491,6 +596,31 @@ impl UvViewerApp {
         }
         if let Some(path) = dialog.save_file() {
             self.export_to(&path);
+        }
+    }
+
+    /// The exports write the spectra, not the trace: in the trace view this
+    /// reports that for `path` and returns `true`, so nothing is written.
+    fn refuse_trace_export(&mut self, path: &Path) -> bool {
+        let refuse = self.plot_mode == PlotMode::Trace;
+        if refuse {
+            self.errors.push(format!(
+                "{}: not written. {TRACE_EXPORT_BLOCKER}",
+                path.display()
+            ));
+        }
+        refuse
+    }
+
+    /// Why File -> Export CSV / Export figure are disabled, or `None` when
+    /// they are enabled.
+    fn export_blocker(&self) -> Option<&'static str> {
+        if self.plot_mode == PlotMode::Trace {
+            Some(TRACE_EXPORT_BLOCKER)
+        } else if !self.any_curve_shown() {
+            Some("No curve is shown")
+        } else {
+            None
         }
     }
 
@@ -529,6 +659,9 @@ impl UvViewerApp {
     /// go to the errors list. Runs on the UI thread, which a PNG can hold up
     /// for about a second in a debug build.
     fn export_figure_to(&mut self, path: &Path) {
+        if self.refuse_trace_export(path) {
+            return;
+        }
         let Some(figure) = self.figure() else {
             self.errors.push(format!(
                 "{}: nothing to export, no curve is shown",
@@ -589,6 +722,54 @@ impl UvViewerApp {
         }
         out
     }
+
+    /// The trace view's series, in file order: one per checked file that has
+    /// a shown curve and can be traced (files that cannot are left out), at
+    /// [`Self::trace_wavelength`] with the current processing applied.
+    fn visible_traces(&self) -> Vec<VisibleTrace<'_>> {
+        let baseline = self.processing.baseline();
+        let normalize = self.processing.normalize();
+        self.files
+            .iter()
+            .filter(|f| f.visible && f.curves.iter().any(|c| c.visible))
+            .filter_map(|file| {
+                let shown: Vec<bool> = file.curves.iter().map(|c| c.visible).collect();
+                trace::trace_points(
+                    &file.dataset,
+                    &shown,
+                    self.trace_wavelength,
+                    &baseline,
+                    &normalize,
+                )
+                // A file that cannot be traced (a single curve, non-numeric
+                // labels) has no series; the reason is not shown here.
+                .ok()
+                .map(|points| (file, points))
+            })
+            .enumerate()
+            .map(|(nth, (file, points))| VisibleTrace {
+                name: file.dataset.name.clone(),
+                points,
+                color: trace::trace_color(file.color_mode, nth),
+                path: &file.path,
+                dataset: &file.dataset,
+            })
+            .collect()
+    }
+}
+
+/// One file's trace as the trace view draws it; see
+/// [`UvViewerApp::visible_traces`].
+struct VisibleTrace<'a> {
+    /// Legend name: the file's name.
+    name: String,
+    /// `[column label, value at the trace wavelength]` points.
+    points: Vec<[f64; 2]>,
+    color: Color32,
+    /// Path of the file, which identifies the trace across file reorders.
+    path: &'a Path,
+    /// The file, for its units.
+    dataset: &'a Dataset,
 }
 
 /// One curve as the plot draws it; see [`UvViewerApp::visible_curves`].
@@ -667,6 +848,16 @@ fn x_value(ui: &mut egui::Ui, value: &mut f64) {
     ui.add(egui::DragValue::new(value).speed(0.5).max_decimals(2));
 }
 
+/// Like [`x_value`], for the trace wavelength, which must stay finite.
+fn trace_x_value(ui: &mut egui::Ui, value: &mut f64) {
+    ui.add(
+        egui::DragValue::new(value)
+            .speed(0.5)
+            .max_decimals(2)
+            .range(TRACE_X_RANGE),
+    );
+}
+
 /// The x and y axis titles for `dataset`'s curves. Shared by the plot and the
 /// CSV headers so they always match.
 fn axis_titles(dataset: &Dataset, normalize: Normalize) -> (String, String) {
@@ -686,6 +877,15 @@ fn axis_label(unit: &str) -> String {
         "ABSORBANCE" => "Absorbance".to_owned(),
         u if u.starts_with("Temperature") => "Temperature / °C".to_owned(),
         u => u.to_owned(),
+    }
+}
+
+/// A File menu export item, disabled with `blocker` as its hover text.
+fn export_button(ui: &mut egui::Ui, blocker: Option<&str>, text: &str) -> egui::Response {
+    let response = ui.add_enabled(blocker.is_none(), egui::Button::new(text));
+    match blocker {
+        Some(why) => response.on_disabled_hover_text(why),
+        None => response,
     }
 }
 
@@ -710,20 +910,12 @@ impl eframe::App for UvViewerApp {
                         ui.close();
                         self.open_dialog();
                     }
-                    let can_export = self.any_curve_shown();
-                    if ui
-                        .add_enabled(can_export, egui::Button::new("Export CSV…"))
-                        .on_disabled_hover_text("No curve is shown")
-                        .clicked()
-                    {
+                    let blocker = self.export_blocker();
+                    if export_button(ui, blocker, "Export CSV…").clicked() {
                         ui.close();
                         self.export_dialog();
                     }
-                    if ui
-                        .add_enabled(can_export, egui::Button::new("Export figure…"))
-                        .on_disabled_hover_text("No curve is shown")
-                        .clicked()
-                    {
+                    if export_button(ui, blocker, "Export figure…").clicked() {
                         ui.close();
                         self.export_figure_dialog();
                     }
@@ -755,6 +947,10 @@ impl eframe::App for UvViewerApp {
             .default_size(320.0)
             .show(ui, |ui| {
                 egui::ScrollArea::vertical().show(ui, |ui| {
+                    ui.heading("View");
+                    self.view_ui(ui);
+
+                    ui.separator();
                     ui.heading("Processing");
                     self.processing_ui(ui);
 
@@ -1433,5 +1629,233 @@ mod tests {
         assert!(!restored.files[0].curves[3].visible);
         assert_eq!(restored.files[0].curve_color(4), Color32::RED);
         assert!(restored.errors.is_empty());
+    }
+
+    fn opened_in_trace_mode(paths: impl IntoIterator<Item = PathBuf>) -> UvViewerApp {
+        let mut app = UvViewerApp::default();
+        app.open_paths(paths);
+        assert!(app.errors.is_empty(), "{:?}", app.errors);
+        app.plot_mode = PlotMode::Trace;
+        app
+    }
+
+    /// The multi-curve fixture and a copy of it at another path, so both can
+    /// be open at once.
+    fn multi_and_copy(test: &str) -> TempCopies {
+        let mut copies = TempCopies::empty(test);
+        let copy = copies.dir.join("multi_copy.txt");
+        std::fs::copy(testdata(fixtures::multi::FILE), &copy).expect("copy fixture");
+        copies.paths.push(copy);
+        copies
+    }
+
+    /// In the trace view each traceable file is one series, named after the
+    /// file, with one point per shown curve; a single-curve file has no trace.
+    #[test]
+    fn trace_view_shows_one_series_per_traceable_file() {
+        let app = opened_in_trace_mode([
+            testdata(fixtures::multi::FILE),
+            testdata(fixtures::single::FILE),
+        ]);
+        assert_eq!(app.trace_wavelength, 400.0);
+
+        let traces = app.visible_traces();
+        assert_eq!(traces.len(), 1);
+        assert_eq!(traces[0].name, "multi_spectra");
+        assert_eq!(traces[0].path, testdata(fixtures::multi::FILE));
+        assert_eq!(traces[0].points.len(), fixtures::multi::LABELS.len());
+        let file = &app.files[0];
+        let shown = vec![true; file.curves.len()];
+        let expected = trace::trace_points(
+            &file.dataset,
+            &shown,
+            400.0,
+            &app.processing.baseline(),
+            &app.processing.normalize(),
+        )
+        .expect("multi file is traceable");
+        assert_eq!(traces[0].points, expected);
+    }
+
+    /// Hidden curves give no point, as in the spectra view.
+    #[test]
+    fn trace_view_skips_hidden_curves() {
+        let mut app = opened_in_trace_mode([testdata(fixtures::multi::FILE)]);
+        app.files[0].curves[1].visible = false;
+        let traces = app.visible_traces();
+        assert_eq!(traces.len(), 1);
+        assert_eq!(traces[0].points.len(), fixtures::multi::LABELS.len() - 1);
+
+        // A file with every curve hidden is left out, like in the spectra view.
+        app.files[0]
+            .curves
+            .iter_mut()
+            .for_each(|c| c.visible = false);
+        assert!(app.visible_traces().is_empty());
+    }
+
+    /// Gradient files take palette colours in the order they are traced, so
+    /// two traced files differ; a single-colour file keeps its own colour.
+    #[test]
+    fn trace_colours_follow_the_files() {
+        let copies = multi_and_copy("trace_colours");
+        let mut app =
+            opened_in_trace_mode([testdata(fixtures::multi::FILE), copies.paths[0].clone()]);
+
+        let traces = app.visible_traces();
+        let names: Vec<&str> = traces.iter().map(|t| t.name.as_str()).collect();
+        assert_eq!(names, ["multi_spectra", "multi_copy"]);
+        assert_eq!(traces[0].color, color::palette(0));
+        assert_eq!(traces[1].color, color::palette(1));
+        assert_ne!(traces[0].color, traces[1].color);
+
+        let red = Color32::from_rgb(200, 10, 10);
+        app.files[1].color_mode = ColorMode::Single(red);
+        assert_eq!(app.visible_traces()[1].color, red);
+    }
+
+    /// An unchecked file is left out, and does not take a palette colour.
+    #[test]
+    fn trace_view_leaves_out_unchecked_files() {
+        let copies = multi_and_copy("trace_unchecked");
+        let mut app =
+            opened_in_trace_mode([testdata(fixtures::multi::FILE), copies.paths[0].clone()]);
+        app.files[0].visible = false;
+
+        let traces = app.visible_traces();
+        assert_eq!(traces.len(), 1);
+        assert_eq!(traces[0].name, "multi_copy");
+        assert_eq!(traces[0].color, color::palette(0));
+    }
+
+    #[test]
+    fn trace_view_axis_titles_name_the_wavelength() {
+        let mut app = opened_in_trace_mode([
+            testdata(fixtures::single::FILE),
+            testdata(fixtures::multi::FILE),
+        ]);
+        let traces = app.visible_traces();
+        let y_title = axis_titles(&app.files[1].dataset, app.processing.normalize()).1;
+        assert_eq!(y_title, "Absorbance");
+        assert_eq!(
+            app.trace_axis_titles(&traces),
+            Some(("Column label".to_owned(), "Absorbance at 400 nm".to_owned()))
+        );
+
+        app.processing.normalize_kind = NormalizeKind::Max;
+        app.trace_wavelength = 395.5;
+        let traces = app.visible_traces();
+        assert_eq!(
+            app.trace_axis_titles(&traces).map(|t| t.1),
+            Some("Normalized at 395.5 nm".to_owned())
+        );
+
+        app.files[1].visible = false;
+        let traces = app.visible_traces();
+        assert!(traces.is_empty());
+        assert_eq!(app.trace_axis_titles(&traces), None);
+    }
+
+    /// Exports write the spectra, so the trace view disables them and says
+    /// why; the spectra view keeps the "no curve is shown" check.
+    #[test]
+    fn export_blocker_explains_why_exports_are_disabled() {
+        let mut app = opened_single_and_multi();
+        assert_eq!(app.export_blocker(), None);
+
+        app.plot_mode = PlotMode::Trace;
+        assert_eq!(app.export_blocker(), Some("Switch to Spectra to export"));
+
+        app.plot_mode = PlotMode::Spectra;
+        app.files.iter_mut().for_each(|f| f.visible = false);
+        assert_eq!(app.export_blocker(), Some("No curve is shown"));
+        assert_eq!(
+            UvViewerApp::default().export_blocker(),
+            Some("No curve is shown")
+        );
+    }
+
+    #[test]
+    fn exports_write_nothing_in_the_trace_view() {
+        let tmp = TempCopies::empty("trace_export");
+        let csv = tmp.dir.join("out.csv");
+        let svg = tmp.dir.join("out.svg");
+        let mut app = opened_single_and_multi();
+        app.plot_mode = PlotMode::Trace;
+
+        app.export_to(&csv);
+        assert_eq!(app.errors.len(), 1, "{:?}", app.errors);
+        assert!(!csv.exists());
+
+        app.export_figure_to(&svg);
+        assert_eq!(app.errors.len(), 2, "{:?}", app.errors);
+        assert!(!svg.exists());
+    }
+
+    /// State saved before the view switch existed loads in the spectra view
+    /// with the default wavelength.
+    #[test]
+    fn state_saved_without_the_view_settings_loads_as_spectra() {
+        let mut saved = UvViewerApp::default();
+        saved.open_paths([testdata(fixtures::multi::FILE)]);
+        let mut value = serde_json::to_value(&saved).expect("serialize");
+        let map = value.as_object_mut().expect("state is a map");
+        assert!(map.remove("plot_mode").is_some());
+        assert!(map.remove("trace_wavelength").is_some());
+
+        let mut restored: UvViewerApp = serde_json::from_value(value).expect("deserialize");
+        restored.reload_files();
+        assert_eq!(restored.plot_mode, PlotMode::Spectra);
+        assert_eq!(restored.trace_wavelength, 400.0);
+        assert_eq!(restored.files.len(), 1);
+    }
+
+    #[test]
+    fn view_settings_survive_a_serde_round_trip() {
+        let app = UvViewerApp {
+            plot_mode: PlotMode::Trace,
+            trace_wavelength: 395.5,
+            ..Default::default()
+        };
+
+        let json = serde_json::to_string(&app).expect("serialize");
+        let restored: UvViewerApp = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(restored.plot_mode, PlotMode::Trace);
+        assert_eq!(restored.trace_wavelength, 395.5);
+    }
+
+    /// A non-finite stored wavelength (which RON, eframe's storage format, can
+    /// hold) is replaced by the default rather than reaching the trace.
+    #[test]
+    fn a_non_finite_stored_wavelength_loads_as_the_default() {
+        use serde::de::value::{Error, MapDeserializer};
+
+        for bad in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            let fields = MapDeserializer::<_, Error>::new([("trace_wavelength", bad)].into_iter());
+            let restored = UvViewerApp::deserialize(fields).expect("deserialize");
+            assert_eq!(restored.trace_wavelength, 400.0, "stored {bad}");
+        }
+        let fields = MapDeserializer::<_, Error>::new([("trace_wavelength", 395.5)].into_iter());
+        let restored = UvViewerApp::deserialize(fields).expect("deserialize");
+        assert_eq!(restored.trace_wavelength, 395.5);
+    }
+
+    /// The λ box only ever holds a finite value: its range clamps whatever it
+    /// is given (a typed "nan" or "inf" is clamped the same way).
+    #[test]
+    fn the_wavelength_box_keeps_the_value_finite() {
+        let ctx = egui::Context::default();
+        for bad in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            let mut value = bad;
+            let _ = ctx.run_ui(egui::RawInput::default(), |ui| {
+                trace_x_value(ui, &mut value);
+            });
+            assert!(value.is_finite(), "{bad} stayed {value}");
+        }
+        let mut value = 395.5;
+        let _ = ctx.run_ui(egui::RawInput::default(), |ui| {
+            trace_x_value(ui, &mut value);
+        });
+        assert_eq!(value, 395.5);
     }
 }
