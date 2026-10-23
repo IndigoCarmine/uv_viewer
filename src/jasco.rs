@@ -120,47 +120,60 @@ pub fn parse(bytes: &[u8], name: &str) -> Result<Dataset, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::fixtures::{self, multi, single, temperature};
+
+    /// The exports print six significant digits.
+    fn assert_close(actual: f64, expected: f64) {
+        assert!(
+            (actual - expected).abs() <= expected.abs() * 1e-5,
+            "{actual} != {expected}"
+        );
+    }
 
     #[test]
     fn parses_single_column_spectrum() {
-        let bytes = include_bytes!("../testdata/20240530_QuinNaphTDP_100microM_CHCl3_1mm.txt");
-        let ds = parse(bytes, "single").unwrap();
+        let bytes = fixtures::read(single::FILE);
+        let ds = parse(&bytes, "single").unwrap();
         assert_eq!(ds.x_unit, "NANOMETERS");
         assert_eq!(ds.y_unit, "ABSORBANCE");
         assert_eq!(ds.curves.len(), 1);
+        assert!(!ds.is_multi());
         let c = &ds.curves[0];
         assert_eq!(c.label, "single");
-        assert_eq!(c.x.len(), 701);
-        assert_eq!(c.x[0], 600.0);
-        assert_eq!(*c.x.last().unwrap(), 250.0);
-        assert!((c.y[0] - 4.98927e-05).abs() < 1e-12);
+        assert_eq!(c.x.len(), single::NPOINTS);
+        assert_eq!(c.x[0], single::x(0));
+        assert_eq!(*c.x.last().unwrap(), single::x(single::NPOINTS - 1));
+        // Written in exponent notation (`...E-05`).
+        assert_close(c.y[0], single::y(0));
     }
 
     #[test]
     fn parses_multi_column_spectra() {
-        let bytes = include_bytes!("../testdata/20231122_QuinNaphtTDP_10microM_MCH.txt");
-        let ds = parse(bytes, "multi").unwrap();
+        let bytes = fixtures::read(multi::FILE);
+        let ds = parse(&bytes, "multi").unwrap();
         assert!(ds.is_multi());
-        assert_eq!(ds.curves.len(), 19);
-        assert_eq!(ds.curves[0].label, "110");
-        assert_eq!(ds.curves[18].label, "20.01");
+        assert_eq!(ds.curves.len(), multi::LABELS.len());
+        assert_eq!(ds.curves[0].label, multi::LABELS[0]);
+        assert_eq!(
+            ds.curves.last().unwrap().label,
+            *multi::LABELS.last().unwrap()
+        );
         for c in &ds.curves {
-            assert_eq!(c.x.len(), 501);
+            assert_eq!(c.x.len(), multi::NPOINTS);
         }
-        assert_eq!(ds.curves[0].x[0], 500.0);
-        assert!((ds.curves[0].y[0] - 0.00256498).abs() < 1e-12);
+        assert_eq!(ds.curves[0].x[0], multi::x(0));
+        assert_close(ds.curves[0].y[0], multi::y(0, 0));
     }
 
     #[test]
     fn parses_temperature_scan() {
-        let bytes = include_bytes!(
-            "../testdata/20231122_QuinoPhTDP_50microM_MCH_NormalCoolingSingleWaveLen.txt"
-        );
-        let ds = parse(bytes, "temp").unwrap();
+        let bytes = fixtures::read(temperature::FILE);
+        let ds = parse(&bytes, "temp").unwrap();
         assert_eq!(ds.x_unit, "Temperature[C]");
         assert_eq!(ds.curves.len(), 1);
-        assert_eq!(ds.curves[0].x.len(), 81);
-        assert_eq!(ds.curves[0].x[0], 100.0);
+        assert_eq!(ds.curves[0].x.len(), temperature::NPOINTS);
+        assert_eq!(ds.curves[0].x[0], temperature::x(0));
+        assert_close(ds.curves[0].y[0], temperature::y(0));
     }
 
     #[test]

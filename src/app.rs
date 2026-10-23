@@ -558,6 +558,7 @@ impl eframe::App for UvViewerApp {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::fixtures;
     use std::path::Path;
 
     fn testdata(name: &str) -> PathBuf {
@@ -569,19 +570,16 @@ mod tests {
     #[test]
     fn opening_the_same_file_twice_is_ignored() {
         let mut app = UvViewerApp::default();
-        let path = testdata("20231122_QuinNaphtTDP_10microM_MCH.txt");
+        let path = testdata(fixtures::multi::FILE);
         app.open_paths([path.clone(), path]);
         assert_eq!(app.files.len(), 1);
-        assert_eq!(app.files[0].curves.len(), 19);
+        assert_eq!(app.files[0].curves.len(), fixtures::multi::LABELS.len());
         assert!(matches!(app.files[0].color_mode, ColorMode::Gradient(_)));
     }
 
     #[test]
     fn move_file_reorders_without_touching_colors() {
-        let names = [
-            "20231122_QuinNaphtTDP_10microM_MCH.txt",
-            "20240530_QuinNaphTDP_100microM_CHCl3_1mm.txt",
-        ];
+        let names = [fixtures::multi::FILE, fixtures::single::FILE];
         let mut app = UvViewerApp::default();
         app.open_paths(names.map(testdata));
         let order =
@@ -618,8 +616,8 @@ mod tests {
     fn state_survives_a_serde_round_trip() {
         let mut app = UvViewerApp::default();
         app.open_paths([
-            testdata("20231122_QuinNaphtTDP_10microM_MCH.txt"),
-            testdata("20240530_QuinNaphTDP_100microM_CHCl3_1mm.txt"),
+            testdata(fixtures::multi::FILE),
+            testdata(fixtures::single::FILE),
         ]);
         app.processing.baseline_kind = BaselineKind::TwoPoint;
         app.files[0].curves[3].visible = false;
@@ -631,7 +629,10 @@ mod tests {
 
         assert_eq!(restored.processing, app.processing);
         assert_eq!(restored.files.len(), 2);
-        assert_eq!(restored.files[0].dataset.curves.len(), 19);
+        assert_eq!(
+            restored.files[0].dataset.curves.len(),
+            fixtures::multi::LABELS.len()
+        );
         assert!(!restored.files[0].curves[3].visible);
         assert_eq!(restored.files[0].curve_color(4), Color32::RED);
         assert!(restored.errors.is_empty());

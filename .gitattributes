@@ -4,3 +4,6 @@
 
 *.png binary
 *.ico binary
+
+# Test fixtures are byte-exact CRLF / CP932 files written by src/fixtures.rs.
+testdata/** -text
