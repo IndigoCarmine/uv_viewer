@@ -215,6 +215,7 @@ impl UvViewerApp {
                 Ok(dataset) => {
                     // Avoid the colours the open files already show, rather than
                     // going by list position, which repeats after a close or move.
+                    // Once all palette colours are taken, they are reused evenly.
                     // Per-curve overrides are deliberate picks and do not count.
                     let in_use = self.files.iter().filter_map(|f| match f.color_mode {
                         ColorMode::Single(c) => Some(c),
@@ -636,18 +637,38 @@ mod tests {
         assert_eq!(colors(&app), before);
     }
 
-    /// Copies the single-curve fixture to `count` distinct paths in a per-test
-    /// temporary directory, since opening the same path twice is ignored.
-    fn single_curve_copies(test: &str, count: usize) -> Vec<PathBuf> {
+    /// Copies of a fixture in a per-test temporary directory, which is removed
+    /// when this guard is dropped (also when the test panics).
+    struct TempCopies {
+        dir: PathBuf,
+        paths: Vec<PathBuf>,
+    }
+
+    impl Drop for TempCopies {
+        fn drop(&mut self) {
+            // Best-effort cleanup: a leftover temp directory must not fail the test.
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    /// Copies the single-curve fixture to `count` distinct paths, since
+    /// opening the same path twice is ignored.
+    fn single_curve_copies(test: &str, count: usize) -> TempCopies {
         let dir = std::env::temp_dir().join(format!("uv_viewer-{test}-{}", std::process::id()));
+        // Clear a leftover from an earlier run that had the same PID.
+        let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("create temp dir");
-        (0..count)
-            .map(|i| {
-                let path = dir.join(format!("single_{i}.txt"));
-                std::fs::copy(testdata(fixtures::single::FILE), &path).expect("copy fixture");
-                path
-            })
-            .collect()
+        // Own the directory before copying, so a failed copy still cleans up.
+        let mut copies = TempCopies {
+            dir,
+            paths: Vec::new(),
+        };
+        for i in 0..count {
+            let path = copies.dir.join(format!("single_{i}.txt"));
+            std::fs::copy(testdata(fixtures::single::FILE), &path).expect("copy fixture");
+            copies.paths.push(path);
+        }
+        copies
     }
 
     fn single_colors(app: &UvViewerApp) -> Vec<Color32> {
@@ -662,7 +683,8 @@ mod tests {
 
     #[test]
     fn closing_a_file_does_not_hand_out_a_colour_in_use() {
-        let paths = single_curve_copies("close", 3);
+        let copies = single_curve_copies("close", 3);
+        let paths = &copies.paths;
         let mut app = UvViewerApp::default();
         app.open_paths(paths[..2].to_vec());
         app.files.remove(0);
@@ -675,7 +697,8 @@ mod tests {
 
     #[test]
     fn reordering_files_does_not_hand_out_a_colour_in_use() {
-        let paths = single_curve_copies("reorder", 3);
+        let copies = single_curve_copies("reorder", 3);
+        let paths = &copies.paths;
         let mut app = UvViewerApp::default();
         app.open_paths(paths[..2].to_vec());
         app.move_file(1, 0);
