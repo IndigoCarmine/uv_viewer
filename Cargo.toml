@@ -17,6 +17,8 @@ serde = { version = "1.0", features = ["derive"] }
 egui_plot = "0.36"
 rfd = "0.15"
 encoding_rs = "0.8"
+# Figure export (PNG/SVG). The default ndarray_support and parallel (rayon) features are unused.
+ruviz = { version = "0.15.1", default-features = false }
 
 # Only used to decode the embedded window icon, so the heavy default codecs are off.
 image = { version = "0.25", default-features = false, features = ["png"] }
