@@ -19,9 +19,11 @@
 //! exponent notation, and parsing them back gives the original value exactly.
 //! Non-finite values (NaN, ±inf) are written as empty cells.
 //!
-//! Names are written as given. No formula-injection escaping (such as a
-//! leading `'`) is done: the names are the user's own file names, and that
-//! escaping would corrupt legitimate names like `-5C_scan`.
+//! Names and headers are written as given. They come from the user's file
+//! names and from the contents of those files (the column labels of a
+//! multi-column file, the `XUNITS`/`YUNITS` units). No formula-injection
+//! escaping (such as a leading `'`) is done: that escaping would corrupt
+//! legitimate names like `-5C_scan`.
 //!
 //! The file starts with a UTF-8 byte order mark (EF BB BF). Without it, Excel
 //! on Japanese Windows reads the file as CP932 and Japanese file names come out

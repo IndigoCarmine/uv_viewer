@@ -8,6 +8,7 @@ use egui_plot::{Legend, Line, Plot};
 use serde::{Deserialize, Serialize};
 
 use crate::color::{self, ColorMode, Colormap};
+use crate::export;
 use crate::jasco::{self, Dataset};
 use crate::processing::{self, Baseline, Normalize};
 
@@ -393,17 +394,8 @@ impl UvViewerApp {
             return;
         }
 
-        let normalize = self.processing.normalize();
-        let first = self
-            .files
-            .iter()
-            .find(|f| f.visible)
-            .unwrap_or(&self.files[0]);
-        let x_label = axis_label(&first.dataset.x_unit);
-        let y_label = if normalize == Normalize::None {
-            axis_label(&first.dataset.y_unit)
-        } else {
-            "Normalized".to_owned()
+        let Some((x_label, y_label)) = self.axis_titles() else {
+            return;
         };
 
         let mut plot = Plot::new("spectra")
@@ -423,6 +415,72 @@ impl UvViewerApp {
                 );
             }
         });
+    }
+
+    /// The plot's x and y axis titles, taken from the first visible file (or
+    /// the first file when none is visible); `None` when no file is open.
+    fn axis_titles(&self) -> Option<(String, String)> {
+        let first = self
+            .files
+            .iter()
+            .find(|f| f.visible)
+            .or(self.files.first())?;
+        Some(axis_titles(&first.dataset, self.processing.normalize()))
+    }
+
+    /// The shown curves as they are written to CSV, headed like the plot axes.
+    fn export_curves(&self) -> Vec<export::ExportCurve> {
+        let normalize = self.processing.normalize();
+        self.visible_curves()
+            .into_iter()
+            .map(|curve| {
+                let (x_header, y_header) = axis_titles(curve.dataset, normalize);
+                export::ExportCurve {
+                    name: curve.name,
+                    x_header,
+                    y_header,
+                    points: curve.points,
+                }
+            })
+            .collect()
+    }
+
+    /// Writes the shown curves to `path`; failures go to the errors list.
+    ///
+    /// With no curve shown nothing is written and that is reported instead:
+    /// the menu item is disabled then, and an export with no columns would
+    /// only be two empty lines.
+    fn export_to(&mut self, path: &Path) {
+        let curves = self.export_curves();
+        if curves.is_empty() {
+            self.errors.push(format!(
+                "{}: nothing to export, no curve is shown",
+                path.display()
+            ));
+            return;
+        }
+        if let Err(e) = export::write_csv(path, &curves) {
+            self.errors.push(e);
+        }
+    }
+
+    /// Where the Export dialog starts: the folder of the first shown curve's
+    /// file, and "<that file's name>_export.csv". `None` when nothing is shown.
+    fn export_default_location(&self) -> Option<(PathBuf, String)> {
+        let curves = self.visible_curves();
+        let first = curves.first()?;
+        let dir = first.path.parent()?.to_path_buf();
+        Some((dir, format!("{}_export.csv", first.dataset.name)))
+    }
+
+    fn export_dialog(&mut self) {
+        let mut dialog = rfd::FileDialog::new().add_filter("CSV", &["csv"]);
+        if let Some((dir, file_name)) = self.export_default_location() {
+            dialog = dialog.set_directory(dir).set_file_name(file_name);
+        }
+        if let Some(path) = dialog.save_file() {
+            self.export_to(&path);
+        }
     }
 
     /// The curves the plot shows, in drawing order (file order, then curve
@@ -447,6 +505,7 @@ impl UvViewerApp {
                     color: file.curve_color(ci),
                     path: &file.path,
                     index: ci,
+                    dataset: &file.dataset,
                 });
             }
         }
@@ -465,6 +524,8 @@ struct VisibleCurve<'a> {
     /// identify the curve across file reorders.
     path: &'a Path,
     index: usize,
+    /// The curve's file, for its units and name.
+    dataset: &'a Dataset,
 }
 
 fn file_body_ui(ui: &mut egui::Ui, file: &mut LoadedFile) {
@@ -528,6 +589,18 @@ fn x_value(ui: &mut egui::Ui, value: &mut f64) {
     ui.add(egui::DragValue::new(value).speed(0.5).max_decimals(2));
 }
 
+/// The x and y axis titles for `dataset`'s curves. Shared by the plot and the
+/// CSV headers so they always match.
+fn axis_titles(dataset: &Dataset, normalize: Normalize) -> (String, String) {
+    let x = axis_label(&dataset.x_unit);
+    let y = if normalize == Normalize::None {
+        axis_label(&dataset.y_unit)
+    } else {
+        "Normalized".to_owned()
+    };
+    (x, y)
+}
+
 /// Turns the JASCO unit strings into axis titles.
 fn axis_label(unit: &str) -> String {
     match unit {
@@ -558,6 +631,15 @@ impl eframe::App for UvViewerApp {
                     if ui.button("Open…").clicked() {
                         ui.close();
                         self.open_dialog();
+                    }
+                    let can_export = !self.visible_curves().is_empty();
+                    if ui
+                        .add_enabled(can_export, egui::Button::new("Export CSV…"))
+                        .on_disabled_hover_text("No curve is shown")
+                        .clicked()
+                    {
+                        ui.close();
+                        self.export_dialog();
                     }
                     if ui.button("Close all").clicked() {
                         self.files.clear();
@@ -714,18 +796,25 @@ mod tests {
         }
     }
 
+    impl TempCopies {
+        /// A fresh, empty per-test temporary directory.
+        fn empty(test: &str) -> Self {
+            let dir = std::env::temp_dir().join(format!("uv_viewer-{test}-{}", std::process::id()));
+            // Clear a leftover from an earlier run that had the same PID.
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).expect("create temp dir");
+            TempCopies {
+                dir,
+                paths: Vec::new(),
+            }
+        }
+    }
+
     /// Copies the single-curve fixture to `count` distinct paths, since
     /// opening the same path twice is ignored.
     fn single_curve_copies(test: &str, count: usize) -> TempCopies {
-        let dir = std::env::temp_dir().join(format!("uv_viewer-{test}-{}", std::process::id()));
-        // Clear a leftover from an earlier run that had the same PID.
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).expect("create temp dir");
         // Own the directory before copying, so a failed copy still cleans up.
-        let mut copies = TempCopies {
-            dir,
-            paths: Vec::new(),
-        };
+        let mut copies = TempCopies::empty(test);
         for i in 0..count {
             let path = copies.dir.join(format!("single_{i}.txt"));
             std::fs::copy(testdata(fixtures::single::FILE), &path).expect("copy fixture");
@@ -941,6 +1030,143 @@ mod tests {
             assert_eq!(curve.color, file.curve_color(curve.index), "{}", curve.name);
         }
         assert_eq!(curves[1 + 4].color, Color32::RED);
+    }
+
+    /// Reads back an exported file: checks the byte order mark and the CRLF
+    /// line ends, and returns the lines split into cells.
+    fn read_export(path: &Path) -> Vec<Vec<String>> {
+        let bytes = std::fs::read(path).expect("read back export");
+        let text = bytes
+            .strip_prefix(&[0xEF, 0xBB, 0xBF][..])
+            .expect("starts with UTF-8 BOM");
+        let text = std::str::from_utf8(text).expect("UTF-8");
+        let body = text.strip_suffix("\r\n").expect("ends with CRLF");
+        body.split("\r\n")
+            .map(|line| line.split(',').map(str::to_owned).collect())
+            .collect()
+    }
+
+    /// File -> Export CSV writes exactly the shown curves (file and curve both
+    /// visible), with the processing applied and the plot's axis titles.
+    #[test]
+    fn export_writes_the_shown_curves_processed() {
+        let tmp = TempCopies::empty("export_shown");
+        let path = tmp.dir.join("out.csv");
+        let mut app = opened_single_and_multi();
+        app.files[1].curves[2].visible = false;
+        app.processing.baseline_kind = BaselineKind::RangeMean;
+        app.processing.normalize_kind = NormalizeKind::Max;
+
+        app.export_to(&path);
+        assert!(app.errors.is_empty(), "{:?}", app.errors);
+
+        let curves = app.visible_curves();
+        assert_eq!(curves.len(), fixtures::multi::LABELS.len());
+        let rows = read_export(&path);
+        let longest = curves.iter().map(|c| c.points.len()).max().unwrap();
+        assert_eq!(rows.len(), 2 + longest);
+
+        let names: Vec<String> = curves
+            .iter()
+            .flat_map(|c| [c.name.clone(), c.name.clone()])
+            .collect();
+        assert_eq!(rows[0], names);
+        let hidden = format!("multi_spectra: {}", fixtures::multi::LABELS[2]);
+        assert!(!rows[0].contains(&hidden));
+
+        let (x_title, y_title) = app.axis_titles().expect("files are open");
+        assert_eq!(x_title, "Wavelength / nm");
+        assert_eq!(y_title, "Normalized");
+        let headers: Vec<String> = curves
+            .iter()
+            .flat_map(|_| [x_title.clone(), y_title.clone()])
+            .collect();
+        assert_eq!(rows[1], headers);
+
+        for (i, row) in rows[2..].iter().enumerate() {
+            assert_eq!(row.len(), 2 * curves.len(), "row {i}");
+            for (k, c) in curves.iter().enumerate() {
+                match c.points.get(i) {
+                    Some([x, y]) => {
+                        let got_x: f64 = row[2 * k].parse().expect("x parses");
+                        let got_y: f64 = row[2 * k + 1].parse().expect("y parses");
+                        assert_eq!(got_x.to_bits(), x.to_bits(), "row {i} curve {k} x");
+                        assert_eq!(got_y.to_bits(), y.to_bits(), "row {i} curve {k} y");
+                    }
+                    None => assert_eq!(row[2 * k..2 * k + 2], ["", ""], "row {i} curve {k}"),
+                }
+            }
+        }
+    }
+
+    /// Without normalization the y header is the y axis title, as in the plot.
+    #[test]
+    fn export_without_normalization_uses_the_y_axis_title() {
+        let tmp = TempCopies::empty("export_raw");
+        let path = tmp.dir.join("out.csv");
+        let mut app = opened_single_and_multi();
+        app.export_to(&path);
+        assert!(app.errors.is_empty(), "{:?}", app.errors);
+
+        let rows = read_export(&path);
+        let (x_title, y_title) = app.axis_titles().expect("files are open");
+        assert_eq!(y_title, "Absorbance");
+        assert_eq!(rows[1][..2], [x_title, y_title]);
+        assert!(rows[1].iter().skip(1).step_by(2).all(|h| h == "Absorbance"));
+    }
+
+    /// A failed write is shown in the errors list instead of panicking.
+    #[test]
+    fn export_failures_are_reported() {
+        let tmp = single_curve_copies("export_fail", 1);
+        let mut app = opened_single_and_multi();
+
+        app.export_to(&tmp.dir.join("missing").join("out.csv"));
+        assert_eq!(app.errors.len(), 1, "{:?}", app.errors);
+
+        // A path below a regular file.
+        app.export_to(&tmp.paths[0].join("out.csv"));
+        assert_eq!(app.errors.len(), 2, "{:?}", app.errors);
+    }
+
+    /// With nothing shown there is nothing to export: no file is written and
+    /// the reason is shown, rather than writing a CSV with two empty lines.
+    #[test]
+    fn export_with_no_shown_curve_writes_nothing() {
+        let tmp = TempCopies::empty("export_none");
+        let path = tmp.dir.join("out.csv");
+        let mut app = opened_single_and_multi();
+        app.files[0].visible = false;
+        app.files[1]
+            .curves
+            .iter_mut()
+            .for_each(|c| c.visible = false);
+
+        app.export_to(&path);
+        assert_eq!(app.errors.len(), 1, "{:?}", app.errors);
+        assert!(!path.exists());
+        assert_eq!(app.export_default_location(), None);
+    }
+
+    /// The save dialog starts in the folder of the first shown file, with
+    /// "<file name>_export.csv" as the name.
+    #[test]
+    fn export_dialog_defaults_follow_the_first_shown_file() {
+        let mut app = opened_single_and_multi();
+        let dir = testdata(fixtures::single::FILE)
+            .parent()
+            .expect("fixture has a folder")
+            .to_path_buf();
+        assert_eq!(
+            app.export_default_location(),
+            Some((dir.clone(), "single_spectrum_export.csv".to_owned()))
+        );
+
+        app.files[0].visible = false;
+        assert_eq!(
+            app.export_default_location(),
+            Some((dir, "multi_spectra_export.csv".to_owned()))
+        );
     }
 
     #[test]
