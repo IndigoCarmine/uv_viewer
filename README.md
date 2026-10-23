@@ -63,7 +63,7 @@ The curve's value at a *Two-point* or *Value at x* position is interpolated line
   - **Single** — every curve of the file gets one colour.
 - Multi-column files start in *Gradient* mode with *Coolwarm*; single-curve files get the first colour of an 8-colour palette that no open file is using (once all 8 are taken, the least-used one).
 - Picking a colour for an individual curve overrides the file's colour mode; **↺** (or **Reset colors** for the whole file) goes back to the file's colours.
-- **Show legend** toggles the plot legend. The axis titles come from the first visible file.
+- **Show legend** toggles the plot legend. The axis titles come from the first file with a shown curve (its file checkbox on and at least one of its curves checked), which is the file of the first curve drawn; while no curve is shown, they come from the first file in the list.
 
 ### Exporting CSV
 
@@ -77,7 +77,7 @@ The curve's value at a *Two-point* or *Value at x* position is interpolated line
 The layout is two columns, x and y, per curve, in the order the curves are drawn (file order in the list, then curve order within the file). The plot legend lists the names alphabetically, so its order can differ from the column order, for example for the temperature scans of a multi-column file.
 
 1. Row 1 — the curve's legend name in both of its columns: the file name without its extension, or `<file name>: <label>` for a curve of a multi-column file.
-2. Row 2 — the x and y titles of the curve's own file, derived from `XUNITS` / `YUNITS` as for the plot axes (*Normalized* for y while normalisation is on). The plot's axis titles follow the first visible file only, so when files with different units are shown together, these headers can differ from the plot's axis titles.
+2. Row 2 — the x and y titles of the curve's own file, derived from `XUNITS` / `YUNITS` as for the plot axes (*Normalized* for y while normalisation is on). The plot's axis titles follow only the first file with a shown curve, so when files with different units are shown together, these headers can differ from the plot's axis titles.
 3. Row 3 onwards — one point per row. Every curve keeps its own x values, so curves on different x grids stay paired with their x. Below the end of a curve shorter than the longest one, both of its cells are empty.
 
 Formatting:
@@ -103,7 +103,7 @@ The columns are then `(name, header)` pairs, such as `("spectrum", "Wavelength /
 **File → Export figure…** draws the shown curves with [ruviz](https://crates.io/crates/ruviz) and saves the figure as PNG, SVG or PDF. The plot in the window is left as it is.
 
 - The same curves as for the CSV export are drawn: those whose file checkbox and own checkbox are both on, including curves hidden by clicking their entry in the plot legend. The menu item is disabled while no curve is shown.
-- The figure matches the plot: the processed values (after baseline correction and normalisation), the curve colours shown on screen, the legend names, and the plot's axis titles (from the first visible file, so for files with different units they can differ from the CSV's second header row).
+- The figure matches the plot: the processed values (after baseline correction and normalisation), the curve colours shown on screen, the legend names, and the plot's axis titles (from the first file with a shown curve, so for files with different units they can differ from the CSV's second header row).
 - The legend is drawn when **Show legend** is on, inside the plot area, where ruviz finds it overlaps the curves least. It lists the curves in drawing order (file order in the list, then curve order within the file), like the CSV columns, whereas the legend in the window is alphabetical.
 - NaN and infinite points are left out of the figure. A curve without any finite point is not drawn; if no shown curve has one, nothing is written and an error is shown.
 - The save dialog offers a *PNG*, *SVG* and *PDF* filter and starts in the folder of the first shown curve's file, with `<that file's name>_figure.png` as the file name (`spectrum.txt` → `spectrum_figure.png`).
@@ -119,13 +119,13 @@ The formats:
 
 In PNG and PDF the text is drawn with the fonts installed in the OS, so a Japanese or other CJK legend name needs a font that covers those characters.
 
-To find those fonts quickly, ruviz keeps a list of the installed font files (their paths, sizes and modification times, not the fonts themselves) in a cache file, which it reads at the first figure export after the viewer starts, and writes when it is missing or the installed fonts have changed:
+To find those fonts quickly, ruviz keeps a list of the installed fonts in a cache file (the paths and modification times of the font folders, the paths, sizes and modification times of the font files, and the number of font faces; not the fonts themselves), which it reads at the first figure export after the viewer starts, and writes when it is missing or the installed fonts have changed:
 
 - Windows: `%LOCALAPPDATA%\ruviz\font-cache-v1.tsv`
 - macOS: `~/Library/Caches/ruviz/font-cache-v1.tsv`
 - Linux: no cache file is written; the fonts are looked up again at the first figure export of every run.
 
-Set the environment variable `RUVIZ_FONT_CACHE=0` to turn the cache off, or `RUVIZ_FONT_CACHE=<folder>` to keep it at `<folder>/font-cache-v1.tsv` instead.
+On Windows and macOS, set the environment variable `RUVIZ_FONT_CACHE=0` to turn the cache off, or `RUVIZ_FONT_CACHE=<folder>` to keep it at `<folder>/font-cache-v1.tsv` instead. On Linux the variable has no effect, since no cache is used there.
 
 ### Saved state
 
