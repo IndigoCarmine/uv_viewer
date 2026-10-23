@@ -84,7 +84,8 @@ fn baseline_values(curve: &Curve, baseline: &Baseline) -> Option<Vec<f64>> {
 /// Returns the processed curve as plot points.
 ///
 /// A baseline or normalisation point that falls outside the curve's x range
-/// leaves that step unapplied rather than hiding the curve.
+/// leaves that step unapplied rather than hiding the curve. Likewise, `Max`
+/// is not applied when the curve has no positive maximum.
 pub fn apply(curve: &Curve, baseline: &Baseline, normalize: &Normalize) -> Vec<[f64; 2]> {
     let mut y = curve.y.clone();
     if let Some(base) = baseline_values(curve, baseline) {
@@ -95,10 +96,16 @@ pub fn apply(curve: &Curve, baseline: &Baseline, normalize: &Normalize) -> Vec<[
 
     let divisor = match *normalize {
         Normalize::None => None,
-        Normalize::Max => y.iter().copied().reduce(f64::max),
-        Normalize::AtX(at) => interp(&curve.x, &y, at),
+        // Only a positive maximum can be scaled to 1; dividing by a negative
+        // one would flip the curve, so leave it unnormalised instead.
+        Normalize::Max => y
+            .iter()
+            .copied()
+            .reduce(f64::max)
+            .filter(|d| *d > MIN_DIVISOR),
+        Normalize::AtX(at) => interp(&curve.x, &y, at).filter(|d| d.abs() > MIN_DIVISOR),
     };
-    if let Some(d) = divisor.filter(|d| d.abs() > MIN_DIVISOR) {
+    if let Some(d) = divisor {
         for v in &mut y {
             *v /= d;
         }
@@ -165,6 +172,19 @@ mod tests {
         let c = line_curve();
         let p = apply(&c, &Baseline::None, &Normalize::Max);
         assert!((ys(&p).iter().copied().reduce(f64::max).unwrap() - 1.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn normalize_max_leaves_all_negative_curve_unchanged() {
+        // No positive maximum exists to scale to 1; dividing by -0.1 would
+        // flip the curve and blow it up to [1, 5, 10].
+        let c = Curve {
+            label: "t".into(),
+            x: vec![3.0, 2.0, 1.0],
+            y: vec![-0.1, -0.5, -1.0],
+        };
+        let p = apply(&c, &Baseline::None, &Normalize::Max);
+        assert_eq!(ys(&p), c.y);
     }
 
     #[test]
