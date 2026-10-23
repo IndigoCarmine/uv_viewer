@@ -8,13 +8,17 @@
 //! format is chosen here from the extension, and an unknown extension is
 //! refused before anything is written.
 
+use std::collections::HashMap;
 use std::fs::OpenOptions;
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use egui::Color32;
-use ruviz::prelude::{Color, Plot};
+use ruviz::core::{Legend, LegendItem, LegendSpacing, measure_legend_size};
+use ruviz::export::page_sizes;
+use ruviz::prelude::{Color, FontConfig, FontFamily, LegendPosition, LineStyle, Plot};
+use ruviz::render::TextRenderer;
 
 /// One curve as it is to be drawn.
 #[derive(Clone, Debug, PartialEq)]
@@ -53,18 +57,24 @@ const LINE_WIDTH: f32 = 1.5;
 // unassigned code points (U+3FF00..) and, close behind, emoji: about 3 ms per
 // legend entry and 1 ms per character. CJK Extension B and varied
 // (non-repeating) common CJK cost less, ASCII almost nothing; the numbers for
-// each are below. All timings are PDF, release build, ruviz 0.15.1.
+// each are below. All timings are release builds with ruviz 0.15.1.
 //
 // The three limits below were chosen by timing [`write_figure`] at them, with
 // both axis titles 100 000 characters long (so cut to [`MAX_TEXT_CHARS`]),
 // curves of 300 points, and every curve named with 1, 12, 13, 30, 100 or 1000
 // characters of one class: so the legend is either [`MAX_LEGEND_ENTRIES`]
-// short entries, or as many entries as fit in [`MAX_LEGEND_CHARS`]. Slowest
-// of those per class, with 100 curves: unassigned 0.82 s, emoji 0.69 s, CJK
-// Extension B 0.37 s, varied CJK 0.15 s, ASCII 0.06 s. With 1000 curves:
-// unassigned 1.25 s, emoji 1.03 s, CJK Extension B 0.71 s, varied CJK 0.50 s,
-// ASCII 0.47 s; of that, about 0.38 s is drawing the 300 000 points, whatever
-// the text.
+// short entries, or as many entries as fit in [`MAX_LEGEND_CHARS`]. Timed
+// again with the legend fitted to the canvas ([`fit_legend`]), the slowest of
+// those per class, as PDF / PNG, with 100 curves: unassigned 0.82 / 0.79 s,
+// emoji 0.48 / 0.08 s, CJK Extension B 0.34 / 0.29 s, varied CJK 0.12 / 0.08 s,
+// ASCII 0.02 / 0.07 s. With 1000 curves: unassigned 0.99 / 1.38 s, emoji
+// 0.61 / 0.69 s, CJK Extension B 0.47 / 0.89 s, varied CJK 0.24 / 0.68 s,
+// ASCII 0.15 / 0.69 s; of that, about 0.15 s (PDF) or 0.6 s (PNG) is drawing
+// the 300 000 points, whatever the text. Measuring the legend names for
+// [`fit_legend`] is up to 0.18 s of these (unassigned) and 0.07 s (CJK
+// Extension B), and too little to tell for the other classes: on the same
+// machine without it, the slowest were unassigned 0.66 / 0.61 s (100 curves)
+// and 0.82 / 1.21 s (1000 curves).
 //
 // The price is that a figure with more than 40 curves, or with long names
 // (for example more than 20 of 25 characters), lists only its first curves in
@@ -79,15 +89,16 @@ const LINE_WIDTH: f32 = 1.5;
 const MAX_TEXT_CHARS: usize = 100;
 
 /// Most legend entries handed to ruviz; [`legend_labels`] leaves the curves
-/// after them without a label, so they are drawn but not listed. ruviz's
-/// legend runs off the figure well before this many entries.
+/// after them without a label, so they are drawn but not listed. Inside the
+/// axes, ruviz's legend runs off the figure well before this many entries, so
+/// [`fit_legend`] moves a legend this long next to the axes.
 const MAX_LEGEND_ENTRIES: usize = 40;
 
 /// Most characters, summed over all legend entries, handed to ruviz;
 /// [`legend_labels`] stops labelling at the first entry that would go past
 /// it. Without this budget, 1000 curves with 100 entries of 10 unassigned code
-/// points took 2.0 s; with it, the slowest case at the limits is the 1.25 s
-/// above, 0.38 s of it the curves.
+/// points took 2.0 s when the limits were chosen; with it, the slowest cases
+/// at the limits are those above.
 const MAX_LEGEND_CHARS: usize = 500;
 
 /// Marks the end of a text cut by [`figure_text`].
@@ -140,6 +151,148 @@ fn legend_labels<'a>(names: impl IntoIterator<Item = &'a str>) -> Vec<Option<Str
         .collect()
 }
 
+// Legend layout.
+//
+// ruviz lays the legend out in the columns it is told (one by default) and
+// never wraps, shrinks or drops entries of a legend it places itself:
+// `legend_best` puts it at one of nine places inside the axes, and a legend
+// taller or wider than the axes runs over the axis labels and off the canvas
+// (24 entries already lose their last two in a 640 x 480 PNG). The canvas does
+// not grow for it either. So [`fit_legend`] decides, from the size the legend
+// will have, between ruviz's default and a legend next to the axes on a
+// canvas widened for it.
+//
+// All sizes are in pixels at ruviz's default 100 dpi, which [`write_figure`]
+// keeps; text sizes are in points, so they do not change with the canvas.
+
+/// Canvas of a PNG or SVG figure: ruviz's default figure, 6.4 x 4.8 in.
+const IMAGE_CANVAS: (u32, u32) = (640, 480);
+
+/// Legend font size: ruviz's default legend font, 9 pt.
+const LEGEND_FONT_PX: f32 = 9.0 * 100.0 / 72.0;
+
+/// Height of the canvas that is not axes, measured in ruviz's SVG (6.94 px
+/// above the axes, 49.03 px below for the x tick labels and title, the same
+/// on every canvas as it depends only on the font sizes), rounded up.
+const NON_AXES_HEIGHT_PX: f32 = 56.0;
+
+/// Widest canvas [`fit_legend`] asks for: ruviz refuses to draw a canvas
+/// wider than 16 384 px ("Image dimension limit exceeded").
+const MAX_CANVAS_WIDTH: u32 = 16_384;
+
+/// Where the legend goes, decided by [`fit_legend`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LegendFit {
+    /// ruviz's default: one column at the best place inside the axes, on the
+    /// default canvas.
+    Inside,
+    /// To the right of the axes, in `columns` columns of entries, on a canvas
+    /// widened to `width` pixels; the canvas height is the default one.
+    Outside { columns: usize, width: u32 },
+}
+
+/// Where a legend listing `labels` goes on a figure whose default canvas is
+/// `canvas` (width, height) pixels; `measure` gives the width of a label as
+/// ruviz draws it in the legend.
+///
+/// The legend stays where ruviz puts it by default ([`LegendFit::Inside`])
+/// when, in one column, it is no wider than half the canvas and no taller than
+/// the axes less ruviz's gap to them. The height test is what the axes hold:
+/// 19 entries in a PNG or SVG (424 px of axes), 17 in a PDF (397 px). The width
+/// test is tighter than the axes, whose width ruviz decides only while
+/// drawing, from the y tick labels: half the canvas leaves the legend inside
+/// the axes for tick labels of up to about 12 characters (about 390 px of
+/// axes for values near 123456789.12, 520 to 540 px for absorbances). Longer
+/// tick labels leave less (128 px for ±1e300), and the legend then runs over
+/// them. So a
+/// figure with up to that many entries keeps its canvas and legend unless a
+/// name is wider than about 270 px in a PNG or SVG, 250 px in a PDF (roughly
+/// 45 or 40 Latin characters, 21 or 19 CJK ones).
+///
+/// Any other legend goes outside the axes, on their right
+/// ([`LegendFit::Outside`]), in the fewest columns whose height fits on the
+/// default canvas height with ruviz's gap above and below: one column holds 21
+/// entries in a PNG or SVG and 19 in a PDF, so [`MAX_LEGEND_ENTRIES`] entries
+/// take 2 and 3 columns. The canvas is widened by the legend and its gaps, so
+/// the axes keep their default width. ruviz measures the legend itself when it
+/// reserves that room and gives the axes whatever is left, so the legend stays
+/// on the canvas even if `measure` is a little off.
+///
+/// The canvas is never wider than [`MAX_CANVAS_WIDTH`], ruviz's limit, so a
+/// PDF page is at most that many points wide. Within the legend limits, one
+/// name of [`MAX_TEXT_CHARS`] characters among [`MAX_LEGEND_ENTRIES`] entries
+/// is the widest legend: with CJK characters it widens a PNG or SVG to 3280
+/// px (two columns) and a PDF to 4557 px (three), with emoji to 4213 and 5956
+/// px. Only glyphs far wider than letters reach the limit: 100 of U+FDFD (a
+/// whole Arabic phrase in one glyph) take 15 767 px in a PNG and would take
+/// 23 286 px in a PDF. Such a legend is drawn on a canvas of the limit, where
+/// ruviz gives it the room left after at least 40 px of axes, and its labels
+/// are cut at the right edge of the canvas.
+fn fit_legend(
+    canvas: (u32, u32),
+    labels: &[&str],
+    mut measure: impl FnMut(&str) -> ruviz::core::Result<f32>,
+) -> ruviz::core::Result<LegendFit> {
+    let (width, height) = (canvas.0 as f32, canvas.1 as f32);
+    let items: Vec<LegendItem> = labels
+        .iter()
+        .map(|label| LegendItem::line(*label, Color::BLACK, LineStyle::Solid, LINE_WIDTH))
+        .collect();
+    // Each label is measured once, however many layouts are sized: measuring
+    // is as slow as drawing for characters the fonts lack.
+    let mut widths: HashMap<String, f32> = HashMap::new();
+    let mut measure_once = |label: &str| match widths.get(label) {
+        Some(&width) => Ok(width),
+        None => {
+            let width = measure(label)?;
+            widths.insert(label.to_owned(), width);
+            Ok(width)
+        }
+    };
+    // ruviz's own formula, with its default spacing, as it sizes the legend.
+    let mut size = |columns: usize| {
+        let legend = Legend {
+            font_size: LEGEND_FONT_PX,
+            columns,
+            ..Legend::default()
+        };
+        measure_legend_size(&items, &legend, &mut measure_once)
+    };
+    // Gap between the legend and the axes or the canvas edge.
+    let pad = LegendSpacing::default()
+        .to_pixels(LEGEND_FONT_PX)
+        .border_axes_pad;
+
+    let mut columns = 1;
+    let (mut legend_width, mut legend_height) = size(columns)?;
+    if legend_width <= width / 2.0 && legend_height + pad <= height - NON_AXES_HEIGHT_PX {
+        return Ok(LegendFit::Inside);
+    }
+    // One row always fits; the bound on `columns` only ends the loop.
+    while legend_height + 2.0 * pad > height && columns < labels.len() {
+        columns += 1;
+        (legend_width, legend_height) = size(columns)?;
+    }
+    let wanted = canvas.0 as f32 + (legend_width + 2.0 * pad).ceil();
+    Ok(LegendFit::Outside {
+        columns,
+        width: wanted.min(MAX_CANVAS_WIDTH as f32) as u32,
+    })
+}
+
+/// [`fit_legend`] for a `format` figure whose curves have `labels`, as from
+/// [`legend_labels`], with the labels measured as ruviz measures them: by its
+/// text renderer, in the default sans-serif family and text options of its
+/// typography.
+fn legend_fit(format: Format, labels: &[Option<String>]) -> ruviz::core::Result<LegendFit> {
+    let listed: Vec<&str> = labels.iter().flatten().map(String::as_str).collect();
+    let text = TextRenderer::new();
+    let font = FontConfig::new(FontFamily::SansSerif, LEGEND_FONT_PX);
+    fit_legend(format.canvas(), &listed, |label| {
+        Ok(text.measure_text(label, &font)?.0)
+    })
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Format {
     Png,
@@ -158,6 +311,29 @@ impl Format {
             _ => None,
         }
     }
+
+    /// The default canvas, (width, height) in pixels. A PDF is drawn on its
+    /// page, ruviz's default `PLOT_DEFAULT` of 160 x 120 mm turned into pixels
+    /// at 96 per inch (604 x 453 px).
+    fn canvas(self) -> (u32, u32) {
+        match self {
+            Self::Png | Self::Svg => IMAGE_CANVAS,
+            Self::Pdf => {
+                let (width, height) = page_sizes::PLOT_DEFAULT;
+                (
+                    page_sizes::mm_to_px(width) as u32,
+                    page_sizes::mm_to_px(height) as u32,
+                )
+            }
+        }
+    }
+}
+
+/// Page width, in mm, that ruviz turns into a canvas `width` pixels wide: it
+/// truncates `mm_to_px`, so half a pixel more keeps rounding error from
+/// taking a pixel off.
+fn pdf_page_width_mm(width: u32) -> f64 {
+    (f64::from(width) + 0.5) * 25.4 / 96.0
 }
 
 /// Draws `figure` and writes it to `path`, as PNG, SVG or PDF by its extension.
@@ -170,6 +346,14 @@ impl Format {
 /// and no other file is left behind. A symbolic link at `path` is itself
 /// replaced, not the file it points to. On failure the error reads
 /// `{path}: {reason}`, like [`crate::jasco::load`].
+///
+/// A PNG or SVG is 640 x 480 px and a PDF page ruviz's default (604 x 453
+/// px, written as a 604 x 453 pt page), unless the legend is too large for the
+/// axes (see [`fit_legend`]): then the legend is drawn to the right of the
+/// axes and the figure is that many pixels wider, at the same height. A PDF
+/// page is then wider by as many points, with the plot and text at their usual
+/// size, so a document that places the figure at a fixed width shows them
+/// smaller.
 pub fn write_figure(path: &Path, figure: &Figure) -> Result<(), String> {
     let fail = |reason: String| format!("{}: {reason}", path.display());
     let format = Format::of(path).ok_or_else(|| {
@@ -200,6 +384,11 @@ pub fn write_figure(path: &Path, figure: &Figure) -> Result<(), String> {
         return Err(fail("no curve with finite points to draw".into()));
     }
     let labels = legend_labels(drawn.iter().map(|(curve, _, _)| curve.name.as_str()));
+    let fit = if figure.legend {
+        Some(legend_fit(format, &labels).map_err(|e| fail(e.to_string()))?)
+    } else {
+        None
+    };
 
     let mut plot = Plot::new()
         .xlabel(figure_text(&figure.x_title))
@@ -216,8 +405,20 @@ pub fn write_figure(path: &Path, figure: &Figure) -> Result<(), String> {
             .line_width(LINE_WIDTH)
             .into();
     }
-    if figure.legend {
-        plot = plot.legend_best();
+    // Width of a canvas widened for the legend; `None` keeps the default.
+    let mut widened = None;
+    match fit {
+        None => {}
+        Some(LegendFit::Inside) => plot = plot.legend_best(),
+        Some(LegendFit::Outside { columns, width }) => {
+            plot = plot
+                .legend(LegendPosition::OutsideRight)
+                .legend_columns(columns);
+            widened = Some(width);
+        }
+    }
+    if let (Some(width), Format::Png | Format::Svg) = (widened, format) {
+        plot = plot.size_px(width, IMAGE_CANVAS.1);
     }
 
     // ruviz writes through a temporary sibling of the path it is given and
@@ -233,8 +434,14 @@ pub fn write_figure(path: &Path, figure: &Figure) -> Result<(), String> {
             match format {
                 Format::Png => plot.save(&target),
                 Format::Svg => plot.export_svg(&target),
-                // ruviz's default page, 160 x 120 mm.
-                Format::Pdf => plot.save_pdf(&target),
+                // ruviz's default page, or one as much wider as the canvas.
+                Format::Pdf => match widened {
+                    None => plot.save_pdf(&target),
+                    Some(width) => plot.save_pdf_with_size(
+                        &target,
+                        Some((pdf_page_width_mm(width), page_sizes::PLOT_DEFAULT.1)),
+                    ),
+                },
             }
             .map_err(|e| e.to_string())
         })
@@ -729,6 +936,339 @@ mod tests {
         let cjk = svg.chars().filter(|&c| c == '合').count();
         assert!(cjk > 0, "no legend text in SVG");
         assert!(cjk <= MAX_LEGEND_CHARS, "{cjk} legend characters in SVG");
+    }
+
+    /// A number attribute `name="…"` of the SVG element that starts at `tag`.
+    fn svg_attr(tag: &str, name: &str) -> f32 {
+        let key = format!(" {name}=\"");
+        let start = tag
+            .find(&key)
+            .unwrap_or_else(|| panic!("no {name} in {tag}"))
+            + key.len();
+        let len = tag[start..].find('"').expect("closing quote");
+        tag[start..start + len].parse().expect("number")
+    }
+
+    /// Width and height of the SVG canvas.
+    fn svg_canvas(svg: &str) -> (f32, f32) {
+        let tag = &svg[svg.find("<svg").expect("<svg")..];
+        (svg_attr(tag, "width"), svg_attr(tag, "height"))
+    }
+
+    /// `(x, y)` of the `<text>` element whose content is exactly `content`.
+    fn svg_text_position(svg: &str, content: &str) -> (f32, f32) {
+        let end = svg
+            .find(&format!(">{content}</text>"))
+            .unwrap_or_else(|| panic!("SVG lacks the text {content:?}"));
+        let tag = &svg[svg[..end].rfind("<text ").expect("<text")..end];
+        (svg_attr(tag, "x"), svg_attr(tag, "y"))
+    }
+
+    /// `(left, top, right, bottom)` of the legend frame, the only rounded,
+    /// translucent rectangle ruviz draws.
+    fn svg_legend_frame(svg: &str) -> (f32, f32, f32, f32) {
+        let at = svg
+            .find("fill=\"rgba(255,255,255,0.800)\"")
+            .expect("SVG has no legend frame");
+        let tag = &svg[svg[..at].rfind("<rect ").expect("<rect")..at];
+        let (x, y) = (svg_attr(tag, "x"), svg_attr(tag, "y"));
+        (
+            x,
+            y,
+            x + svg_attr(tag, "width"),
+            y + svg_attr(tag, "height"),
+        )
+    }
+
+    /// Width and height of a PNG file, from its IHDR chunk.
+    fn png_size(bytes: &[u8]) -> (u32, u32) {
+        assert!(bytes.starts_with(PNG_SIGNATURE), "not a PNG file");
+        let be = |at: usize| u32::from_be_bytes(bytes[at..at + 4].try_into().unwrap());
+        (be(16), be(20))
+    }
+
+    /// One curve for each of `names`, all with the same points, so the axes
+    /// do not change with the names.
+    fn named_curves(names: impl IntoIterator<Item = String>) -> Figure {
+        Figure {
+            curves: names
+                .into_iter()
+                .map(|name| FigureCurve {
+                    name,
+                    points: vec![[200.0, 0.1], [800.0, 1.2]],
+                    color: Color32::RED,
+                })
+                .collect(),
+            x_title: "Wavelength [nm]".into(),
+            y_title: "Abs".into(),
+            legend: true,
+        }
+    }
+
+    /// Checks that every legend entry of `figure` is in the SVG and on its
+    /// canvas, and that the legend frame is too.
+    fn assert_svg_legend_on_canvas(figure: &Figure, svg: &str) {
+        let (width, height) = svg_canvas(svg);
+        let (left, top, right, bottom) = svg_legend_frame(svg);
+        assert!(
+            left >= 0.0 && top >= 0.0 && right <= width && bottom <= height,
+            "legend frame {left}..{right} x {top}..{bottom} off the {width} x {height} canvas"
+        );
+        let labels = legend_labels(figure.curves.iter().map(|c| c.name.as_str()));
+        for label in labels.iter().flatten() {
+            let (x, y) = svg_text_position(svg, label);
+            assert!(
+                (left..=right).contains(&x) && (top..=bottom).contains(&y),
+                "legend entry {label:?} at ({x}, {y}) outside the frame"
+            );
+        }
+    }
+
+    #[test]
+    fn every_legend_entry_of_many_curves_is_on_the_canvas() {
+        let dir = TempDir::new("legend-fit");
+        let cases = [
+            // The most entries, with short names.
+            named_curves((0..MAX_LEGEND_ENTRIES + 5).map(|k| format!("sample {k}"))),
+            // The longest names, as many as the character budget allows.
+            named_curves(
+                (0..MAX_LEGEND_CHARS / MAX_TEXT_CHARS)
+                    .map(|k| format!("{k}").repeat(MAX_TEXT_CHARS / 2) + &"合".repeat(50)),
+            ),
+            // Many entries, one of them as long as a name can be.
+            named_curves(
+                std::iter::once("合".repeat(MAX_TEXT_CHARS))
+                    .chain((1..MAX_LEGEND_ENTRIES).map(|k| format!("s{k}"))),
+            ),
+        ];
+        for (k, figure) in cases.iter().enumerate() {
+            let svg_path = dir.path(&format!("figure{k}.svg"));
+            write_figure(&svg_path, figure).expect("write SVG");
+            let svg = std::fs::read_to_string(&svg_path).expect("read SVG");
+            assert_svg_legend_on_canvas(figure, &svg);
+            // Beside the axes, at the default height, the canvas widened by
+            // the legend as ruviz measured it and its two 12.5 px gaps: so
+            // the labels are measured here as ruviz measures them.
+            let (width, height) = svg_canvas(&svg);
+            let (left, _, right, _) = svg_legend_frame(&svg);
+            assert_eq!(height, IMAGE_CANVAS.1 as f32);
+            assert!(left > IMAGE_CANVAS.0 as f32 / 2.0, "legend left at {left}");
+            let expected = IMAGE_CANVAS.0 as f32 + (right - left + 25.0).ceil();
+            assert!(
+                (width - expected).abs() <= 1.0,
+                "{width} px, not {expected}"
+            );
+
+            // PNG is laid out by the same code at the same size.
+            let png_path = dir.path(&format!("figure{k}.png"));
+            write_figure(&png_path, figure).expect("write PNG");
+            assert_eq!(
+                png_size(&std::fs::read(&png_path).unwrap()),
+                (width as u32, height as u32)
+            );
+
+            // PDF: ruviz draws the same SVG on a canvas the page size sets.
+            let pdf_path = dir.path(&format!("figure{k}.pdf"));
+            write_figure(&pdf_path, figure).expect("write PDF");
+            let labels = legend_labels(figure.curves.iter().map(|c| c.name.as_str()));
+            let LegendFit::Outside { width, .. } = legend_fit(Format::Pdf, &labels).unwrap() else {
+                panic!("PDF legend left inside the axes");
+            };
+            let page = pdf_media_box(&std::fs::read(&pdf_path).unwrap());
+            assert_eq!(page, (width, Format::Pdf.canvas().1));
+        }
+    }
+
+    /// Width and height of the page of a one-page PDF written by ruviz, which
+    /// gives its MediaBox in whole units of its canvas pixels.
+    fn pdf_media_box(bytes: &[u8]) -> (u32, u32) {
+        assert!(bytes.starts_with(PDF_SIGNATURE), "not a PDF file");
+        let text = String::from_utf8_lossy(bytes);
+        let start = text.find("/MediaBox [").expect("no MediaBox") + "/MediaBox [".len();
+        let numbers: Vec<u32> = text[start..start + text[start..].find(']').unwrap()]
+            .split_whitespace()
+            .map(|n| n.parse().expect("whole number"))
+            .collect();
+        assert_eq!(numbers[..2], [0, 0]);
+        (numbers[2], numbers[3])
+    }
+
+    /// `figure`, all of whose points are finite and whose names fit the
+    /// legend limits, as [`write_figure`] drew it before it fitted the
+    /// legend: ruviz's default canvas and its best place inside the axes.
+    fn default_layout_plot(figure: &Figure) -> Plot {
+        let mut plot = Plot::new()
+            .xlabel(figure_text(&figure.x_title))
+            .ylabel(figure_text(&figure.y_title));
+        for curve in &figure.curves {
+            let (xs, ys): (Vec<f64>, Vec<f64>) = curve.points.iter().map(|&[x, y]| (x, y)).unzip();
+            let [r, g, b, a] = curve.color.to_srgba_unmultiplied();
+            plot = plot
+                .line(&xs, &ys)
+                .label(figure_text(&curve.name))
+                .color(Color::from_rgba(r, g, b, a))
+                .line_width(LINE_WIDTH)
+                .into();
+        }
+        plot.legend_best()
+    }
+
+    #[test]
+    fn a_legend_the_axes_hold_keeps_the_default_figure() {
+        let dir = TempDir::new("legend-default");
+        let names = |n: usize| (0..n).map(|k| format!("sample-{k}.txt Abs"));
+        let read = |name: &str| std::fs::read(dir.path(name)).expect("read figure");
+
+        // The most entries the axes hold: 19 in a PNG or SVG, 17 in a PDF.
+        for figure in [fixture_figure(), named_curves(names(19))] {
+            for name in ["figure.svg", "figure.png"] {
+                write_figure(&dir.path(name), &figure).expect(name);
+            }
+            default_layout_plot(&figure)
+                .export_svg(dir.path("default.svg"))
+                .expect("write default SVG");
+            default_layout_plot(&figure)
+                .save(dir.path("default.png"))
+                .expect("write default PNG");
+            assert!(read("figure.svg") == read("default.svg"), "SVG changed");
+            assert!(read("figure.png") == read("default.png"), "PNG changed");
+            assert_eq!(png_size(&read("figure.png")), IMAGE_CANVAS);
+        }
+        let figure = named_curves(names(17));
+        write_figure(&dir.path("figure.pdf"), &figure).expect("write PDF");
+        default_layout_plot(&figure)
+            .save_pdf(dir.path("default.pdf"))
+            .expect("write default PDF");
+        assert!(read("figure.pdf") == read("default.pdf"), "PDF changed");
+
+        // The legend font is the one the labels are measured in.
+        let svg = std::fs::read_to_string(dir.path("figure.svg")).unwrap();
+        let end = svg.find(">sample-0.txt Abs<").expect("legend entry");
+        let tag = &svg[svg[..end].rfind("<text ").unwrap()..end];
+        assert_eq!(svg_attr(tag, "font-size"), LEGEND_FONT_PX);
+
+        // One entry more than the axes hold moves the legend out.
+        write_figure(&dir.path("more.svg"), &named_curves(names(20))).expect("write SVG");
+        let more = std::fs::read_to_string(dir.path("more.svg")).unwrap();
+        assert!(svg_canvas(&more).0 > IMAGE_CANVAS.0 as f32);
+        write_figure(&dir.path("more.pdf"), &named_curves(names(18))).expect("write PDF");
+        assert!(pdf_media_box(&read("more.pdf")).0 > Format::Pdf.canvas().0);
+    }
+
+    #[test]
+    fn fit_legend_moves_a_tall_or_wide_legend_beside_the_axes() {
+        let fit = |canvas, n: usize, label_width: f32| {
+            let labels = vec!["x"; n];
+            fit_legend(canvas, &labels, |_| Ok(label_width)).unwrap()
+        };
+        let image = IMAGE_CANVAS;
+        let pdf = Format::Pdf.canvas();
+        assert_eq!(pdf, (604, 453));
+        // With 20 px labels, a legend is 7.5 px of padding on either side and
+        // columns of 57.5 px (line, gap and label) 25 px apart. Beside the
+        // axes it takes 12.5 px of gap on either side.
+        let outside = |columns: usize, canvas: (u32, u32)| {
+            let legend = 15.0 + 57.5 * columns as f32 + 25.0 * (columns - 1) as f32;
+            LegendFit::Outside {
+                columns,
+                width: canvas.0 + (legend + 25.0).ceil() as u32,
+            }
+        };
+        for n in [0, 1, 19] {
+            assert_eq!(fit(image, n, 20.0), LegendFit::Inside, "{n} entries");
+        }
+        assert_eq!(fit(image, 20, 20.0), outside(1, image));
+        assert_eq!(fit(image, 21, 20.0), outside(1, image));
+        assert_eq!(fit(image, 22, 20.0), outside(2, image));
+        assert_eq!(fit(image, MAX_LEGEND_ENTRIES, 20.0), outside(2, image));
+        assert_eq!(fit(pdf, 17, 20.0), LegendFit::Inside);
+        assert_eq!(fit(pdf, 18, 20.0), outside(1, pdf));
+        assert_eq!(fit(pdf, 19, 20.0), outside(1, pdf));
+        assert_eq!(fit(pdf, 20, 20.0), outside(2, pdf));
+        assert_eq!(fit(pdf, MAX_LEGEND_ENTRIES, 20.0), outside(3, pdf));
+
+        // A legend wider than half the canvas goes out however short it is:
+        // 52.5 + 267.5 = 320 px still fits a 640 px canvas.
+        assert_eq!(fit(image, 1, 267.5), LegendFit::Inside);
+        assert_eq!(
+            fit(image, 1, 268.0),
+            LegendFit::Outside {
+                columns: 1,
+                width: 640 + 346
+            }
+        );
+
+        // The canvas stops at ruviz's limit.
+        for canvas in [image, pdf] {
+            for (n, columns) in [
+                (1, 1),
+                (MAX_LEGEND_ENTRIES, if canvas == pdf { 3 } else { 2 }),
+            ] {
+                assert_eq!(
+                    fit(canvas, n, 20_000.0),
+                    LegendFit::Outside {
+                        columns,
+                        width: MAX_CANVAS_WIDTH
+                    }
+                );
+            }
+        }
+        // 16 384 - 640 - 25 - 15 - 37.5 = 15 666.5 px of label is the most a
+        // PNG legend of one column gets in full.
+        assert_eq!(
+            fit(image, 1, 15_666.5),
+            LegendFit::Outside {
+                columns: 1,
+                width: MAX_CANVAS_WIDTH
+            }
+        );
+        assert_eq!(
+            fit(image, 1, 15_660.0),
+            LegendFit::Outside {
+                columns: 1,
+                width: MAX_CANVAS_WIDTH - 6
+            }
+        );
+    }
+
+    #[test]
+    fn fit_legend_measures_each_label_once() {
+        let labels: Vec<String> = (0..MAX_LEGEND_ENTRIES).map(|k| format!("s{k}")).collect();
+        let labels: Vec<&str> = labels.iter().map(String::as_str).collect();
+        for canvas in [IMAGE_CANVAS, Format::Pdf.canvas()] {
+            let mut measured = Vec::new();
+            let fit = fit_legend(canvas, &labels, |label| {
+                measured.push(label.to_owned());
+                Ok(20.0)
+            })
+            .unwrap();
+            // Two or three column layouts were sized, each label measured once.
+            assert!(matches!(fit, LegendFit::Outside { columns: 2.., .. }));
+            assert_eq!(measured, labels);
+        }
+    }
+
+    #[test]
+    fn a_legend_wider_than_ruviz_allows_is_written_on_the_widest_canvas() {
+        // U+FDFD is one glyph as wide as a phrase: 100 of them, within the
+        // legend limits, ask for a canvas wider than ruviz draws in a PDF.
+        let figure = named_curves(
+            std::iter::once("\u{FDFD}".repeat(MAX_TEXT_CHARS))
+                .chain((1..MAX_LEGEND_ENTRIES).map(|k| format!("s{k}"))),
+        );
+        let dir = TempDir::new("legend-widest");
+        let write = |name: &str| {
+            let path = dir.path(name);
+            write_figure(&path, &figure).unwrap_or_else(|e| panic!("{e}"));
+            std::fs::read(path).unwrap()
+        };
+        let svg = String::from_utf8(write("figure.svg")).unwrap();
+        assert!(svg_canvas(&svg).0 <= MAX_CANVAS_WIDTH as f32);
+        assert_svg_legend_on_canvas(&figure, &svg);
+        assert!(png_size(&write("figure.png")).0 <= MAX_CANVAS_WIDTH);
+        let (width, height) = pdf_media_box(&write("figure.pdf"));
+        assert!(width <= MAX_CANVAS_WIDTH, "{width} pt wide PDF page");
+        assert_eq!(height, Format::Pdf.canvas().1);
     }
 
     #[test]
