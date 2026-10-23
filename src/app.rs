@@ -1,7 +1,7 @@
 //! The application state and its per-frame update logic.
 
 use std::ffi::OsString;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use egui::{Color32, RichText};
 use egui_plot::{Legend, Line, Plot};
@@ -393,7 +393,6 @@ impl UvViewerApp {
             return;
         }
 
-        let baseline = self.processing.baseline();
         let normalize = self.processing.normalize();
         let first = self
             .files
@@ -414,28 +413,58 @@ impl UvViewerApp {
             plot = plot.legend(Legend::default());
         }
         plot.show(ui, |plot_ui| {
-            for file in self.files.iter().filter(|f| f.visible) {
-                for (ci, curve) in file.dataset.curves.iter().enumerate() {
-                    if !file.curves[ci].visible {
-                        continue;
-                    }
-                    let name = if file.dataset.is_multi() {
-                        format!("{}: {}", file.dataset.name, curve.label)
-                    } else {
-                        file.dataset.name.clone()
-                    };
-                    let points = processing::apply(curve, &baseline, &normalize);
-                    plot_ui.line(
-                        Line::new(name, points)
-                            // Keyed by path so legend-hidden curves survive a reorder.
-                            .id(egui::Id::new(("curve", &file.path, ci)))
-                            .color(file.curve_color(ci))
-                            .width(1.5),
-                    );
-                }
+            for curve in self.visible_curves() {
+                plot_ui.line(
+                    Line::new(curve.name, curve.points)
+                        // Keyed by path so legend-hidden curves survive a reorder.
+                        .id(egui::Id::new(("curve", curve.path, curve.index)))
+                        .color(curve.color)
+                        .width(1.5),
+                );
             }
         });
     }
+
+    /// The curves the plot shows, in drawing order (file order, then curve
+    /// order), with the current processing applied.
+    fn visible_curves(&self) -> Vec<VisibleCurve<'_>> {
+        let baseline = self.processing.baseline();
+        let normalize = self.processing.normalize();
+        let mut out = Vec::new();
+        for file in self.files.iter().filter(|f| f.visible) {
+            for (ci, curve) in file.dataset.curves.iter().enumerate() {
+                if !file.curves[ci].visible {
+                    continue;
+                }
+                let name = if file.dataset.is_multi() {
+                    format!("{}: {}", file.dataset.name, curve.label)
+                } else {
+                    file.dataset.name.clone()
+                };
+                out.push(VisibleCurve {
+                    name,
+                    points: processing::apply(curve, &baseline, &normalize),
+                    color: file.curve_color(ci),
+                    path: &file.path,
+                    index: ci,
+                });
+            }
+        }
+        out
+    }
+}
+
+/// One curve as the plot draws it; see [`UvViewerApp::visible_curves`].
+struct VisibleCurve<'a> {
+    /// Legend name.
+    name: String,
+    /// Processed `[x, y]` points.
+    points: Vec<[f64; 2]>,
+    color: Color32,
+    /// Path of the curve's file and the curve's index in it, which together
+    /// identify the curve across file reorders.
+    path: &'a Path,
+    index: usize,
 }
 
 fn file_body_ui(ui: &mut egui::Ui, file: &mut LoadedFile) {
@@ -797,6 +826,121 @@ mod tests {
         assert_eq!(app.files.len(), 1);
         assert!(app.files[0].path.is_absolute());
         assert!(app.errors.is_empty());
+    }
+
+    fn visible_names(app: &UvViewerApp) -> Vec<String> {
+        app.visible_curves().into_iter().map(|c| c.name).collect()
+    }
+
+    fn opened_single_and_multi() -> UvViewerApp {
+        let mut app = UvViewerApp::default();
+        app.open_paths([
+            testdata(fixtures::single::FILE),
+            testdata(fixtures::multi::FILE),
+        ]);
+        assert!(app.errors.is_empty());
+        app
+    }
+
+    /// Curves come in file order, then curve order; a multi-curve file names
+    /// each curve "file: label", a single-curve file just "file".
+    #[test]
+    fn visible_curves_are_named_in_plot_order() {
+        let app = opened_single_and_multi();
+        let expected: Vec<String> = std::iter::once("single_spectrum".to_owned())
+            .chain(
+                fixtures::multi::LABELS
+                    .iter()
+                    .map(|label| format!("multi_spectra: {label}")),
+            )
+            .collect();
+        assert_eq!(visible_names(&app), expected);
+
+        let keys: Vec<(&Path, usize)> = app
+            .visible_curves()
+            .iter()
+            .map(|c| (c.path, c.index))
+            .collect();
+        let single = testdata(fixtures::single::FILE);
+        let multi = testdata(fixtures::multi::FILE);
+        let expected_keys: Vec<(&Path, usize)> = std::iter::once((single.as_path(), 0))
+            .chain((0..fixtures::multi::LABELS.len()).map(|i| (multi.as_path(), i)))
+            .collect();
+        assert_eq!(keys, expected_keys);
+        // The plot used to key lines by `&PathBuf`; `&Path` hashes the same, so
+        // legend-hidden state keeps its id.
+        assert_eq!(
+            egui::Id::new(("curve", multi.as_path(), 1)),
+            egui::Id::new(("curve", &multi, 1))
+        );
+    }
+
+    #[test]
+    fn hiding_a_file_hides_all_its_curves() {
+        let mut app = opened_single_and_multi();
+        app.files[1].visible = false;
+        assert_eq!(visible_names(&app), ["single_spectrum"]);
+
+        app.files[1].visible = true;
+        app.files[0].visible = false;
+        assert_eq!(
+            visible_names(&app).len(),
+            fixtures::multi::LABELS.len(),
+            "only the multi-curve file's curves remain"
+        );
+        assert!(
+            app.visible_curves()
+                .iter()
+                .all(|c| c.path == testdata(fixtures::multi::FILE))
+        );
+    }
+
+    #[test]
+    fn hiding_one_curve_hides_only_that_curve() {
+        let mut app = opened_single_and_multi();
+        app.files[1].curves[2].visible = false;
+        let expected: Vec<String> = std::iter::once("single_spectrum".to_owned())
+            .chain(
+                fixtures::multi::LABELS
+                    .iter()
+                    .enumerate()
+                    .filter(|&(i, _)| i != 2)
+                    .map(|(_, label)| format!("multi_spectra: {label}")),
+            )
+            .collect();
+        assert_eq!(visible_names(&app), expected);
+        assert!(
+            app.visible_curves()
+                .iter()
+                .all(|c| !(c.path == testdata(fixtures::multi::FILE) && c.index == 2))
+        );
+    }
+
+    /// The points are the processed values and the colours the file's curve
+    /// colours, including a per-curve override.
+    #[test]
+    fn visible_curves_carry_processed_points_and_colors() {
+        let mut app = opened_single_and_multi();
+        app.processing.baseline_kind = BaselineKind::RangeMean;
+        app.processing.normalize_kind = NormalizeKind::Max;
+        app.files[1].curves[4].color = Some(Color32::RED);
+        let baseline = app.processing.baseline();
+        let normalize = app.processing.normalize();
+
+        let curves = app.visible_curves();
+        assert_eq!(curves.len(), 1 + fixtures::multi::LABELS.len());
+        for curve in &curves {
+            let file = app
+                .files
+                .iter()
+                .find(|f| f.path == curve.path)
+                .expect("curve belongs to an open file");
+            let expected =
+                processing::apply(&file.dataset.curves[curve.index], &baseline, &normalize);
+            assert_eq!(curve.points, expected, "{}", curve.name);
+            assert_eq!(curve.color, file.curve_color(curve.index), "{}", curve.name);
+        }
+        assert_eq!(curves[1 + 4].color, Color32::RED);
     }
 
     #[test]
