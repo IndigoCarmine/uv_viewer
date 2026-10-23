@@ -153,7 +153,7 @@ fn noise(seed: u64, i: usize) -> f64 {
 }
 
 /// Formats like C's `%G` with six significant digits, as the exports do:
-/// `0.00256498`, `1.90094`, `4.98927E-05`.
+/// `0.001234567` -> `0.00123457`, `3.25` -> `3.25`, `0.000015` -> `1.5E-05`.
 fn fmt_g(v: f64) -> String {
     let sci = format!("{v:.5e}");
     let (mantissa, exp) = sci.split_once('e').expect("exponent");
@@ -486,6 +486,13 @@ pub(crate) fn dir() -> PathBuf {
 pub(crate) fn read(name: &str) -> Vec<u8> {
     std::fs::read(dir().join(name))
         .unwrap_or_else(|e| panic!("testdata/{name}: {e}; run the regenerate_fixtures test"))
+}
+
+#[test]
+fn fmt_g_matches_doc_examples() {
+    assert_eq!(fmt_g(0.001234567), "0.00123457");
+    assert_eq!(fmt_g(3.25), "3.25");
+    assert_eq!(fmt_g(0.000015), "1.5E-05");
 }
 
 #[test]
