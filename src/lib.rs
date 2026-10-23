@@ -5,6 +5,8 @@
 
 pub mod app;
 pub mod color;
+#[cfg(test)]
+pub(crate) mod fixtures;
 pub mod jasco;
 pub mod processing;
 
