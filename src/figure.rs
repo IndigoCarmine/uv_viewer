@@ -8,7 +8,10 @@
 //! format is chosen here from the extension, and an unknown extension is
 //! refused before anything is written.
 
-use std::path::Path;
+use std::fs::OpenOptions;
+use std::io::ErrorKind;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use egui::Color32;
 use ruviz::prelude::{Color, Plot};
@@ -162,8 +165,11 @@ impl Format {
 /// Non-finite points are left out; a curve without any finite point is not
 /// drawn. Fails, without writing, when the extension is not one of
 /// [`EXTENSIONS`] or when no curve has a finite point. Missing parent
-/// directories are created. On failure the error reads `{path}: {reason}`, like
-/// [`crate::jasco::load`].
+/// directories are created. An existing file at `path` is replaced; when it
+/// cannot be (it is read-only, or held open on Windows), it is left as it was
+/// and no other file is left behind. A symbolic link at `path` is itself
+/// replaced, not the file it points to. On failure the error reads
+/// `{path}: {reason}`, like [`crate::jasco::load`].
 pub fn write_figure(path: &Path, figure: &Figure) -> Result<(), String> {
     let fail = |reason: String| format!("{}: {reason}", path.display());
     let format = Format::of(path).ok_or_else(|| {
@@ -214,19 +220,105 @@ pub fn write_figure(path: &Path, figure: &Figure) -> Result<(), String> {
         plot = plot.legend_best();
     }
 
-    match format {
-        Format::Png => plot.save(path),
-        Format::Svg => plot.export_svg(path),
-        // ruviz's default page, 160 x 120 mm.
-        Format::Pdf => plot.save_pdf(path),
+    // ruviz writes through a temporary sibling of the path it is given and
+    // keeps that file when the final replace fails (on Windows, for a
+    // read-only destination or one another program holds open), so it would
+    // pile up next to the user's figure on every retry. ruviz is therefore
+    // given a new file of ours, which its replace never fails on, and that
+    // file is moved over `path` here and removed if anything fails.
+    let temp = create_temp(path).map_err(|e| fail(e.to_string()))?;
+    let result = for_ruviz(&temp)
+        .map_err(|e| e.to_string())
+        .and_then(|target| {
+            match format {
+                Format::Png => plot.save(&target),
+                Format::Svg => plot.export_svg(&target),
+                // ruviz's default page, 160 x 120 mm.
+                Format::Pdf => plot.save_pdf(&target),
+            }
+            .map_err(|e| e.to_string())
+        })
+        .and_then(|()| std::fs::rename(&temp, path).map_err(|e| e.to_string()));
+    if result.is_err() {
+        // The write error is what is reported.
+        let _ = std::fs::remove_file(&temp);
     }
-    .map_err(|e| fail(e.to_string()))
+    result.map_err(fail)
+}
+
+/// Most names [`create_temp`] tries before giving up.
+const TEMP_ATTEMPTS: u32 = 100;
+
+/// Creates a new, empty file in the directory of `path`, creating missing
+/// directories, for the figure to be written to before it is moved over
+/// `path`, and returns its path. Being in the same directory, the move is a
+/// rename on one volume.
+///
+/// The name is `.uvv-{pid}-{n}.tmp`, `n` counting up in this process, and the
+/// file is created only if no file has that name yet, so nothing that exists
+/// is overwritten or followed. The name is short and does not grow with the
+/// file name of `path`, as ruviz names its own temporary file after it (see
+/// [`for_ruviz`]).
+fn create_temp(path: &Path) -> std::io::Result<PathBuf> {
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    if let Some(dir) = path.parent().filter(|dir| !dir.as_os_str().is_empty()) {
+        std::fs::create_dir_all(dir)?;
+    }
+    let mut last = None;
+    for _ in 0..TEMP_ATTEMPTS {
+        let n = NEXT.fetch_add(1, Ordering::Relaxed);
+        let temp = path.with_file_name(format!(".uvv-{}-{n}.tmp", std::process::id()));
+        match OpenOptions::new().write(true).create_new(true).open(&temp) {
+            Ok(_) => return Ok(temp),
+            Err(e) if e.kind() == ErrorKind::AlreadyExists => last = Some(e),
+            Err(e) => return Err(e),
+        }
+    }
+    Err(last.expect("TEMP_ATTEMPTS is not 0"))
+}
+
+/// `temp` as it is handed to ruviz.
+///
+/// On Windows, ruviz writes `.{file name}.{pid}.{n}.tmp` next to the path it
+/// is given and moves it into place with MoveFileExW, which fails once either
+/// path reaches MAX_PATH (260 UTF-16 units) unless it is a `\\?\` path; the
+/// standard library makes long paths `\\?\` ones itself, ruviz does not. A
+/// temporary name of ours that is longer than the destination's name would
+/// make that happen for shorter destinations than before, so ruviz is given
+/// the absolute `\\?\` form of `temp`, for which there is no such limit.
+#[cfg(windows)]
+fn for_ruviz(temp: &Path) -> std::io::Result<PathBuf> {
+    use std::ffi::OsString;
+    use std::os::windows::ffi::{OsStrExt, OsStringExt};
+    use std::path::{Component, Prefix};
+
+    // Resolves `.`, `..` and `/`, which a `\\?\` path must not contain.
+    let absolute = std::path::absolute(temp)?;
+    let wide: Vec<u16> = absolute.as_os_str().encode_wide().collect();
+    let (prefix, rest) = match absolute.components().next() {
+        // `C:\dir` becomes `\\?\C:\dir`.
+        Some(Component::Prefix(p)) if matches!(p.kind(), Prefix::Disk(_)) => (r"\\?\", &wide[..]),
+        // `\\server\share\dir` becomes `\\?\UNC\server\share\dir`.
+        Some(Component::Prefix(p)) if matches!(p.kind(), Prefix::UNC(..)) => {
+            (r"\\?\UNC", &wide[1..])
+        }
+        // Already a `\\?\` or device path.
+        _ => return Ok(absolute),
+    };
+    let mut verbatim: Vec<u16> = prefix.encode_utf16().collect();
+    verbatim.extend_from_slice(rest);
+    Ok(OsString::from_wide(&verbatim).into())
+}
+
+/// `temp` as it is handed to ruviz: unchanged, as only Windows limits ruviz's
+/// path length.
+#[cfg(not(windows))]
+fn for_ruviz(temp: &Path) -> std::io::Result<PathBuf> {
+    Ok(temp.to_path_buf())
 }
 
 #[cfg(test)]
 mod tests {
-    use std::path::PathBuf;
-
     use super::*;
     use crate::fixtures;
     use crate::jasco;
@@ -655,5 +747,163 @@ mod tests {
             assert!(err.starts_with(&path.display().to_string()), "{err}");
         }
         assert!(dir.entries().is_empty(), "wrote {:?}", dir.entries());
+    }
+
+    #[test]
+    fn existing_figure_is_replaced() {
+        let dir = TempDir::new("replace");
+        let figure = one_curve("a", vec![[1.0, 1.0], [2.0, 3.0]]);
+        for name in ["figure.png", "figure.svg", "figure.pdf"] {
+            let path = dir.path(name);
+            std::fs::write(&path, b"old").expect("write old file");
+            write_figure(&path, &figure).expect("replace figure");
+            assert_ne!(std::fs::read(&path).unwrap(), b"old", "{name} not replaced");
+        }
+        assert!(
+            std::fs::read(dir.path("figure.png"))
+                .unwrap()
+                .starts_with(PNG_SIGNATURE)
+        );
+        assert!(
+            std::fs::read_to_string(dir.path("figure.svg"))
+                .unwrap()
+                .contains("<svg")
+        );
+        assert!(
+            std::fs::read(dir.path("figure.pdf"))
+                .unwrap()
+                .starts_with(PDF_SIGNATURE)
+        );
+        assert_eq!(dir.entries(), ["figure.pdf", "figure.png", "figure.svg"]);
+    }
+
+    /// Makes a file read-only, and writable again when dropped (also when the
+    /// test panics), so that [`TempDir`] can remove it. Declare it after the
+    /// [`TempDir`] so that it is dropped first.
+    #[cfg(windows)]
+    struct ReadOnly(PathBuf);
+
+    #[cfg(windows)]
+    impl ReadOnly {
+        fn new(path: PathBuf) -> Self {
+            Self::set(&path, true);
+            ReadOnly(path)
+        }
+
+        fn set(path: &Path, readonly: bool) {
+            let mut permissions = std::fs::metadata(path).expect("metadata").permissions();
+            permissions.set_readonly(readonly);
+            std::fs::set_permissions(path, permissions).expect("set permissions");
+        }
+    }
+
+    #[cfg(windows)]
+    impl Drop for ReadOnly {
+        fn drop(&mut self) {
+            Self::set(&self.0, false);
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn read_only_destination_is_an_error_that_leaves_no_temporary_file() {
+        let dir = TempDir::new("read-only");
+        let figure = one_curve("a", vec![[1.0, 1.0], [2.0, 3.0]]);
+        let names = ["ro.pdf", "ro.png", "ro.svg"];
+        let _guards: Vec<ReadOnly> = names
+            .iter()
+            .map(|name| {
+                let path = dir.path(name);
+                std::fs::write(&path, b"old").expect("write old file");
+                ReadOnly::new(path)
+            })
+            .collect();
+        for name in names {
+            let path = dir.path(name);
+            let err = write_figure(&path, &figure).expect_err("must fail");
+            assert!(err.starts_with(&path.display().to_string()), "{err}");
+            assert_eq!(std::fs::read(&path).unwrap(), b"old", "{name} changed");
+        }
+        assert_eq!(dir.entries(), names);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn locked_destination_is_an_error_that_leaves_no_temporary_file() {
+        use std::os::windows::fs::OpenOptionsExt;
+
+        let dir = TempDir::new("locked");
+        let path = dir.path("locked.png");
+        std::fs::write(&path, b"old").expect("write old file");
+        // Opened with no sharing, as some viewers keep a figure open.
+        let handle = std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(0)
+            .open(&path)
+            .expect("open without sharing");
+        let err = write_figure(&path, &one_curve("a", vec![[1.0, 1.0], [2.0, 3.0]]))
+            .expect_err("must fail");
+        drop(handle);
+        assert!(err.starts_with(&path.display().to_string()), "{err}");
+        assert_eq!(std::fs::read(&path).unwrap(), b"old");
+        assert_eq!(dir.entries(), ["locked.png"]);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn ruviz_is_given_verbatim_paths() {
+        for (temp, expected) in [
+            (r"C:\a\b\.uvv-1-0.tmp", r"\\?\C:\a\b\.uvv-1-0.tmp"),
+            (r"C:/a/../b/./.uvv-1-0.tmp", r"\\?\C:\b\.uvv-1-0.tmp"),
+            (
+                r"\\server\share\d\.uvv-1-0.tmp",
+                r"\\?\UNC\server\share\d\.uvv-1-0.tmp",
+            ),
+            (r"\\?\C:\a\.uvv-1-0.tmp", r"\\?\C:\a\.uvv-1-0.tmp"),
+        ] {
+            assert_eq!(for_ruviz(Path::new(temp)).unwrap(), Path::new(expected));
+        }
+        let relative = for_ruviz(Path::new(".uvv-1-0.tmp")).unwrap();
+        assert!(
+            relative.to_str().unwrap().starts_with(r"\\?\"),
+            "{relative:?}"
+        );
+        assert!(relative.ends_with(".uvv-1-0.tmp"), "{relative:?}");
+    }
+
+    /// Length of `path` in UTF-16 units, the unit of Windows' MAX_PATH.
+    #[cfg(windows)]
+    fn utf16_len(path: &Path) -> usize {
+        use std::os::windows::ffi::OsStrExt;
+        path.as_os_str().encode_wide().count()
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn destination_close_to_max_path_is_written_without_temporary_files() {
+        // ruviz moves its temporary file into place with MoveFileExW, which
+        // fails for a path of MAX_PATH (260) UTF-16 units or more unless it is
+        // a `\\?\` path. Handed these destinations directly, ruviz's temporary
+        // `.{file name}.{pid}.{n}.tmp` is at most 20 units longer, so they
+        // were written fine; a long and a short file name are both covered.
+        const TOTALS: [usize; 2] = [230, 238];
+        assert!(TOTALS.iter().all(|total| total + 20 < 260));
+        let dir = TempDir::new("max-path");
+        let figure = one_curve("a", vec![[1.0, 1.0], [2.0, 3.0]]);
+        let names = [format!("{}.png", "n".repeat(40)), "a.png".to_string()];
+        for (name, total) in names.iter().zip(TOTALS) {
+            // `dir` + `\` + `d...d` + `\` + `name` makes `total` units.
+            let pad = total - utf16_len(&dir.0) - 2 - name.len();
+            let sub = dir.0.join("d".repeat(pad));
+            let path = sub.join(name);
+            assert_eq!(utf16_len(&path), total);
+            write_figure(&path, &figure).expect("write figure");
+            assert!(std::fs::read(&path).unwrap().starts_with(PNG_SIGNATURE));
+            let entries: Vec<_> = std::fs::read_dir(&sub)
+                .expect("read dir")
+                .map(|e| e.expect("dir entry").file_name())
+                .collect();
+            assert_eq!(entries, [name.as_str()], "{total} units");
+        }
     }
 }
