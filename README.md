@@ -65,6 +65,33 @@ The curve's value at a *Two-point* or *Value at x* position is interpolated line
 - Picking a colour for an individual curve overrides the file's colour mode; **↺** (or **Reset colors** for the whole file) goes back to the file's colours.
 - **Show legend** toggles the plot legend. The axis titles come from the first file with a shown curve (its file checkbox on and at least one of its curves checked), which is the file of the first curve drawn; while no curve is shown, they come from the first file in the list.
 
+### Temperature trace
+
+The trace view plots, for a multi-column file such as a temperature scan, each scan's value at one wavelength against its column label: the melting or association curve.
+
+- Switch views under *View* at the top of the side panel: **Spectra** (the curves, y against x) or **Temperature trace**. The **λ** box below them sets the wavelength (the x value) to read the curves at; it is enabled only in the trace view, starts at 400 and accepts values from −1 000 000 to 1 000 000.
+- Each point is one shown curve: x is its column label as a number, y is the curve's value at λ after the *Processing* settings (baseline first, then normalisation), interpolated linearly between data points. These are the same values the spectra view draws.
+- The points are joined in column order, not sorted by label, so a file that was heated and then cooled draws its loop.
+- A curve gives no point when λ lies outside its x range or its value there is not finite (NaN or infinite); the other curves of the file still give theirs. Hidden curves give no point, as in the spectra view.
+- Each traced file is one series, drawn as a line with filled circle markers, with one legend entry named after the file (without its extension). **Show legend** applies here too, and the legend lists the names alphabetically, as in the spectra view.
+- Colours: a file in *Single* mode keeps its colour. A file in *Gradient* mode takes a colour from the 8-colour palette by its position in list order among the traceable files that take part, i.e. are checked and have a shown curve (the first one gets the first palette colour, and so on). Per-curve colours are not used. A traceable file with no point at the current λ is not drawn and has no legend entry, but still counts for this position, so the other files keep their colours while λ moves past the end of its data.
+- Axis titles: x is *Column label*; y is the y title of the first file drawn (*Absorbance*, or *Normalized* while normalisation is on, …) followed by `at <λ> nm` when that file's `XUNITS` is `NANOMETERS`, and by `at x = <λ>` otherwise, for example *Absorbance at 400 nm*. Here and in the messages below, λ is written with at most two decimals and no trailing zeros (`395.5`, `395.13`).
+
+Files left out:
+
+- A file whose checkbox is off, or whose curves are all hidden, is left out without comment.
+- Any other file that draws nothing gets a **🚫** after its name in the file list (only in the trace view); hovering it shows why:
+  - a single-curve file: `Needs a file with several columns, e.g. a temperature series.`
+  - a column label that is not a finite number: `Needs every column label to be a number, e.g. the scan temperature.`
+  - λ outside the x range of every shown curve: `λ = <λ> is outside this file's x range`
+  - λ inside the x range of a shown curve, but no shown curve has a finite value there: `No shown curve has a finite value at λ = <λ>`
+- When nothing at all can be drawn, a message takes the plot's place:
+  - `No curve is shown` when no checked file has a shown curve;
+  - `No shown file can be traced.` followed by the reason above when every such file is untraceable for the same reason, or by `Hover 🚫 in the file list for why.` when the reasons differ;
+  - otherwise `Nothing to plot at λ = <λ>. Hover 🚫 in the file list for why.`
+
+**File → Export CSV…** and **File → Export figure…** write the spectra, not the trace, so both are disabled in the trace view; hovering them shows `Switch to Spectra to export`.
+
 ### Exporting CSV
 
 **File → Export CSV…** writes the shown curves to a CSV file, with the *Processing* settings applied: the values are the ones the plot draws, after baseline correction and normalisation.
@@ -129,7 +156,7 @@ On Windows and macOS, set the environment variable `RUVIZ_FONT_CACHE=0` to turn 
 
 ### Saved state
 
-The open files and the settings are saved by eframe's `persistence` feature and restored on the next start: the file paths and their order, file and curve visibility, colour modes and curve colours, the processing settings and the legend toggle. Only the paths are stored, not the data, so the files are re-read from disk on startup. A file that can no longer be read is removed from the list and reported as an error. A file's per-curve settings are kept as long as it still has the same number of curves; otherwise they are reset.
+The open files and the settings are saved by eframe's `persistence` feature and restored on the next start: the file paths and their order, file and curve visibility, colour modes and curve colours, the processing settings, the legend toggle, and the view (*Spectra* or *Temperature trace*) with its λ. State saved by a version without the trace view opens in *Spectra* with λ = 400, and a stored λ that is not finite is replaced by 400. Only the paths are stored, not the data, so the files are re-read from disk on startup. A file that can no longer be read is removed from the list and reported as an error. A file's per-curve settings are kept as long as it still has the same number of curves; otherwise they are reset.
 
 ## What's in the box
 
