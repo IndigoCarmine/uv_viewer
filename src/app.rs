@@ -37,6 +37,9 @@ const TRACE_X_RANGE: RangeInclusive<f64> = -1.0e6..=1.0e6;
 /// Why the exports are disabled in the trace view.
 const TRACE_EXPORT_BLOCKER: &str = "Switch to Spectra to export";
 
+/// Marks a file row whose file gives no trace; hovering it shows why.
+const TRACE_HINT_MARKER: &str = "🚫";
+
 /// Reads a stored trace wavelength, replacing a non-finite one (which RON,
 /// eframe's storage format, can hold) by the default.
 fn finite_trace_wavelength<'de, D: Deserializer<'de>>(d: D) -> Result<f64, D::Error> {
@@ -388,7 +391,9 @@ impl UvViewerApp {
         let dragged = egui::DragAndDrop::payload::<FileDrag>(ui.ctx()).map(|p| p.0);
         let pointer = ui.ctx().pointer_interact_pos();
         let mut drop_to = None;
-        for (fi, file) in self.files.iter_mut().enumerate() {
+        // Computed before the loop, which borrows the files mutably.
+        let hints: Vec<Option<String>> = self.files.iter().map(|f| self.trace_hint(f)).collect();
+        for ((fi, file), hint) in self.files.iter_mut().enumerate().zip(hints) {
             let id = ui.make_persistent_id(("file", &file.path));
             let rect = ui
                 .scope(|ui| {
@@ -408,6 +413,10 @@ impl UvViewerApp {
                         ui.checkbox(&mut file.visible, "");
                         ui.label(&file.dataset.name)
                             .on_hover_text(file.path.display().to_string());
+                        if let Some(hint) = hint {
+                            ui.label(RichText::new(TRACE_HINT_MARKER).weak())
+                                .on_hover_text(hint);
+                        }
                         if ui.small_button("✖").on_hover_text("Close file").clicked() {
                             remove = Some(fi);
                         }
@@ -477,7 +486,14 @@ impl UvViewerApp {
     }
 
     fn trace_plot_ui(&self, ui: &mut egui::Ui) {
-        let traces = self.visible_traces();
+        let file_traces = self.file_traces();
+        if let Some(message) = self.trace_empty_message_for(&file_traces) {
+            ui.centered_and_justified(|ui| {
+                ui.label(message);
+            });
+            return;
+        }
+        let traces = visible_traces(file_traces);
         let mut plot = Plot::new("trace");
         if let Some((x_label, y_label)) = self.trace_axis_titles(&traces) {
             plot = plot.x_axis_label(x_label).y_axis_label(y_label);
@@ -723,39 +739,163 @@ impl UvViewerApp {
         out
     }
 
-    /// The trace view's series, in file order: one per checked file that has
-    /// a shown curve and can be traced (files that cannot are left out), at
-    /// [`Self::trace_wavelength`] with the current processing applied.
-    fn visible_traces(&self) -> Vec<VisibleTrace<'_>> {
-        let baseline = self.processing.baseline();
-        let normalize = self.processing.normalize();
+    /// How `file` takes part in the trace view at [`Self::trace_wavelength`]
+    /// with the current processing applied; `None` when it is unchecked or
+    /// has no shown curve, i.e. left out by the user.
+    fn file_trace(&self, file: &LoadedFile) -> Option<FileTrace> {
+        if !(file.visible && file.curves.iter().any(|c| c.visible)) {
+            return None;
+        }
+        let shown: Vec<bool> = file.curves.iter().map(|c| c.visible).collect();
+        let trace = trace::trace_points(
+            &file.dataset,
+            &shown,
+            self.trace_wavelength,
+            &self.processing.baseline(),
+            &self.processing.normalize(),
+        );
+        Some(match trace {
+            Ok(points) if points.is_empty() => FileTrace::NoPoints,
+            Ok(points) => FileTrace::Points(points),
+            Err(why) => FileTrace::NotTraceable(why),
+        })
+    }
+
+    /// [`Self::file_trace`] of every file that takes part, in file order.
+    fn file_traces(&self) -> Vec<(&LoadedFile, FileTrace)> {
         self.files
             .iter()
-            .filter(|f| f.visible && f.curves.iter().any(|c| c.visible))
-            .filter_map(|file| {
-                let shown: Vec<bool> = file.curves.iter().map(|c| c.visible).collect();
-                trace::trace_points(
-                    &file.dataset,
-                    &shown,
-                    self.trace_wavelength,
-                    &baseline,
-                    &normalize,
-                )
-                // A file that cannot be traced (a single curve, non-numeric
-                // labels) has no series; the reason is not shown here.
-                .ok()
-                .map(|points| (file, points))
+            .filter_map(|file| Some((file, self.file_trace(file)?)))
+            .collect()
+    }
+
+    /// The trace view's series, in file order: one per checked file that has
+    /// a shown curve and gives a point at [`Self::trace_wavelength`], with the
+    /// current processing applied.
+    ///
+    /// The plot builds these from the same [`Self::file_traces`] as its empty
+    /// message, so that each file is traced once per frame; this is the
+    /// stand-alone form for the tests.
+    #[cfg(test)]
+    fn visible_traces(&self) -> Vec<VisibleTrace<'_>> {
+        visible_traces(self.file_traces())
+    }
+
+    /// Why `file` gives no trace, shown next to its name in the trace view;
+    /// `None` in the spectra view, when the file is traced, and when the user
+    /// left it out (unchecked, or every curve hidden).
+    fn trace_hint(&self, file: &LoadedFile) -> Option<String> {
+        if self.plot_mode != PlotMode::Trace {
+            return None;
+        }
+        let at = trace::format_x(self.trace_wavelength);
+        match self.file_trace(file)? {
+            FileTrace::Points(_) => None,
+            FileTrace::NotTraceable(why) => Some(why.reason().to_owned()),
+            FileTrace::NoPoints if self.wavelength_in_shown_range(file) => {
+                Some(format!("No shown curve has a finite value at λ = {at}"))
+            }
+            FileTrace::NoPoints => Some(format!("λ = {at} is outside this file's x range")),
+        }
+    }
+
+    /// Whether the trace wavelength lies in the x range of a shown curve of
+    /// `file`.
+    fn wavelength_in_shown_range(&self, file: &LoadedFile) -> bool {
+        let at = self.trace_wavelength;
+        file.dataset
+            .curves
+            .iter()
+            .zip(&file.curves)
+            .filter(|(_, state)| state.visible)
+            .any(|(curve, _)| {
+                let lo = curve.x.iter().copied().fold(f64::INFINITY, f64::min);
+                let hi = curve.x.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+                (lo..=hi).contains(&at)
             })
-            .enumerate()
-            .map(|(nth, (file, points))| VisibleTrace {
+    }
+
+    /// The text the trace view shows in place of a plot with no point;
+    /// `None` in the spectra view or when some file is traced.
+    ///
+    /// Stand-alone form for the tests; see [`Self::visible_traces`].
+    #[cfg(test)]
+    fn trace_empty_message(&self) -> Option<String> {
+        if self.plot_mode != PlotMode::Trace {
+            return None;
+        }
+        self.trace_empty_message_for(&self.file_traces())
+    }
+
+    /// [`Self::trace_empty_message`] in the trace view, from its
+    /// [`Self::file_traces`].
+    fn trace_empty_message_for(&self, traces: &[(&LoadedFile, FileTrace)]) -> Option<String> {
+        if traces
+            .iter()
+            .any(|(_, t)| matches!(t, FileTrace::Points(_)))
+        {
+            return None;
+        }
+        if traces.is_empty() {
+            return Some("No curve is shown".to_owned());
+        }
+        let hover = format!("Hover {TRACE_HINT_MARKER} in the file list for why.");
+        // Every file's reason, or `None` when some file can be traced.
+        let reasons: Option<Vec<trace::NotTraceable>> = traces
+            .iter()
+            .map(|(_, t)| match t {
+                FileTrace::NotTraceable(why) => Some(*why),
+                FileTrace::Points(_) | FileTrace::NoPoints => None,
+            })
+            .collect();
+        let message = match reasons {
+            // One reason for all: say it here rather than send the user to the list.
+            Some(reasons) if reasons.iter().all(|r| *r == reasons[0]) => {
+                format!("No shown file can be traced. {}", reasons[0].reason())
+            }
+            Some(_) => format!("No shown file can be traced. {hover}"),
+            None => format!(
+                "Nothing to plot at λ = {}. {hover}",
+                trace::format_x(self.trace_wavelength)
+            ),
+        };
+        Some(message)
+    }
+}
+
+/// How one checked file with a shown curve takes part in the trace view.
+enum FileTrace {
+    /// Its trace, with at least one point.
+    Points(Vec<[f64; 2]>),
+    /// It can be traced, but no shown curve gives a point at the wavelength.
+    NoPoints,
+    /// It cannot be traced.
+    NotTraceable(trace::NotTraceable),
+}
+
+/// The series of `traces` (see [`UvViewerApp::file_traces`]) that have points.
+///
+/// Gradient files take palette colours in the order of the traceable files,
+/// counting the ones without points: a file that has no point at the current
+/// wavelength is not drawn and has no legend entry, but holds its colour, so
+/// the other files' colours do not change while λ is dragged across the end
+/// of its data.
+fn visible_traces(traces: Vec<(&LoadedFile, FileTrace)>) -> Vec<VisibleTrace<'_>> {
+    traces
+        .into_iter()
+        .filter(|(_, t)| !matches!(t, FileTrace::NotTraceable(_)))
+        .enumerate()
+        .filter_map(|(nth, (file, t))| match t {
+            FileTrace::Points(points) => Some(VisibleTrace {
                 name: file.dataset.name.clone(),
                 points,
                 color: trace::trace_color(file.color_mode, nth),
                 path: &file.path,
                 dataset: &file.dataset,
-            })
-            .collect()
-    }
+            }),
+            FileTrace::NoPoints | FileTrace::NotTraceable(_) => None,
+        })
+        .collect()
 }
 
 /// One file's trace as the trace view draws it; see
@@ -1857,5 +1997,167 @@ mod tests {
             trace_x_value(ui, &mut value);
         });
         assert_eq!(value, 395.5);
+    }
+
+    fn hints(app: &UvViewerApp) -> Vec<Option<String>> {
+        app.files.iter().map(|f| app.trace_hint(f)).collect()
+    }
+
+    /// The spectra view shows no trace hints and no trace message.
+    #[test]
+    fn trace_hints_are_none_in_the_spectra_view() {
+        let mut app = opened_single_and_multi();
+        app.trace_wavelength = 500.0;
+        assert_eq!(hints(&app), [None, None]);
+        assert_eq!(app.trace_empty_message(), None);
+    }
+
+    /// Single-curve files are marked with why they are left out, and with
+    /// only such files open the plot says so instead of staying empty.
+    #[test]
+    fn single_curve_files_are_marked_as_left_out() {
+        let app = opened_in_trace_mode([
+            testdata(fixtures::single::FILE),
+            testdata(fixtures::temperature::FILE),
+        ]);
+        let reason = trace::NotTraceable::SingleCurve.reason().to_owned();
+        assert_eq!(hints(&app), [Some(reason.clone()), Some(reason.clone())]);
+        assert!(app.visible_traces().is_empty());
+        assert_eq!(
+            app.trace_empty_message(),
+            Some(format!("No shown file can be traced. {reason}"))
+        );
+    }
+
+    #[test]
+    fn a_file_with_a_text_label_is_marked_as_left_out() {
+        let mut app = opened_in_trace_mode([testdata(fixtures::multi::FILE)]);
+        app.files[0].dataset.curves[1].label = "warm".to_owned();
+        assert_eq!(
+            hints(&app),
+            [Some(
+                trace::NotTraceable::NonNumericLabels.reason().to_owned()
+            )]
+        );
+    }
+
+    /// A traceable file without a point at λ says that λ is outside its data,
+    /// with λ written as in the axis title; inside the data there is no hint.
+    #[test]
+    fn a_wavelength_outside_the_data_is_explained() {
+        let mut app = opened_in_trace_mode([testdata(fixtures::multi::FILE)]);
+        app.trace_wavelength = 500.0;
+        assert_eq!(
+            hints(&app),
+            [Some("λ = 500 is outside this file's x range".to_owned())]
+        );
+        assert_eq!(
+            app.trace_empty_message(),
+            Some("Nothing to plot at λ = 500. Hover 🚫 in the file list for why.".to_owned())
+        );
+
+        app.trace_wavelength = 500.126;
+        assert_eq!(
+            hints(&app),
+            [Some("λ = 500.13 is outside this file's x range".to_owned())]
+        );
+
+        app.trace_wavelength = 395.0;
+        assert_eq!(hints(&app), [None]);
+        assert_eq!(app.trace_empty_message(), None);
+    }
+
+    /// Inside the data but with no finite value there, the hint does not
+    /// claim that λ is out of range.
+    #[test]
+    fn a_wavelength_with_no_finite_value_is_explained() {
+        let mut app = opened_in_trace_mode([testdata(fixtures::multi::FILE)]);
+        for curve in &mut app.files[0].dataset.curves {
+            curve.y.iter_mut().for_each(|y| *y = f64::NAN);
+        }
+        assert_eq!(
+            hints(&app),
+            [Some(
+                "No shown curve has a finite value at λ = 400".to_owned()
+            )]
+        );
+        assert!(app.trace_empty_message().is_some());
+    }
+
+    /// Unchecked files and files with every curve hidden are left out by the
+    /// user's own choice, which the file list already shows: no hint.
+    #[test]
+    fn files_left_out_by_the_user_get_no_hint() {
+        let mut app = opened_in_trace_mode([
+            testdata(fixtures::single::FILE),
+            testdata(fixtures::multi::FILE),
+        ]);
+        app.trace_wavelength = 500.0;
+        app.files[0].visible = false;
+        app.files[1]
+            .curves
+            .iter_mut()
+            .for_each(|c| c.visible = false);
+        assert_eq!(hints(&app), [None, None]);
+        assert_eq!(
+            app.trace_empty_message(),
+            Some("No curve is shown".to_owned())
+        );
+    }
+
+    /// With one file traced, the plot is drawn: no message, whatever the other
+    /// files' hints.
+    #[test]
+    fn a_traced_file_means_no_empty_message() {
+        let app = opened_in_trace_mode([
+            testdata(fixtures::single::FILE),
+            testdata(fixtures::multi::FILE),
+        ]);
+        assert!(hints(&app)[0].is_some());
+        assert_eq!(hints(&app)[1], None);
+        assert_eq!(app.trace_empty_message(), None);
+    }
+
+    /// A file with no point at λ has no series (so no empty legend entry), but
+    /// keeps its palette colour, so other files' colours stay put while λ is
+    /// dragged across the end of its data.
+    #[test]
+    fn a_file_without_points_keeps_its_colour_but_has_no_series() {
+        let copies = multi_and_copy("trace_no_points");
+        let mut app =
+            opened_in_trace_mode([testdata(fixtures::multi::FILE), copies.paths[0].clone()]);
+        for curve in &mut app.files[0].dataset.curves {
+            curve.x.iter_mut().for_each(|x| *x += 200.0);
+        }
+
+        let traces = app.visible_traces();
+        let names: Vec<&str> = traces.iter().map(|t| t.name.as_str()).collect();
+        assert_eq!(names, ["multi_copy"]);
+        assert_eq!(traces[0].color, color::palette(1));
+        assert_eq!(
+            app.trace_axis_titles(&traces),
+            Some(("Column label".to_owned(), "Absorbance at 400 nm".to_owned()))
+        );
+        assert!(hints(&app)[0].is_some());
+    }
+
+    /// The left-out marker is drawn by the default fonts, not as the
+    /// missing-glyph box (as "⊘" would be).
+    ///
+    /// Compares atlas images rather than asking `has_glyphs`, which also says
+    /// no for glyphs of the font that holds the replacement box.
+    #[test]
+    fn the_trace_hint_marker_has_a_glyph() {
+        let ctx = egui::Context::default();
+        let _ = ctx.run_ui(egui::RawInput::default(), |_| {});
+        let font = egui::TextStyle::Body.resolve(&ctx.global_style());
+        let uv_rect = |text: &str| {
+            let galley =
+                ctx.fonts_mut(|f| f.layout_no_wrap(text.to_owned(), font.clone(), Color32::WHITE));
+            galley.rows[0].row.glyphs[0].uv_rect
+        };
+        // A noncharacter, which no font has, is drawn as the replacement box.
+        let missing = uv_rect("\u{FFFF}");
+        assert_ne!(uv_rect(TRACE_HINT_MARKER), missing);
     }
 }
