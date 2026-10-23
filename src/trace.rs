@@ -90,7 +90,7 @@ pub fn trace_axis_titles(x_unit: &str, y_title: &str, at: f64) -> (String, Strin
 }
 
 /// `x` with at most two decimals and no trailing zeros: 395, 395.5, 395.13.
-fn format_x(x: f64) -> String {
+pub(crate) fn format_x(x: f64) -> String {
     let s = format!("{x:.2}");
     let s = s.trim_end_matches('0').trim_end_matches('.');
     if s == "-0" {
