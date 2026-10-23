@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::color::{self, ColorMode, Colormap};
 use crate::export;
+use crate::figure;
 use crate::jasco::{self, Dataset};
 use crate::processing::{self, Baseline, Normalize};
 
@@ -467,10 +468,16 @@ impl UvViewerApp {
     /// Where the Export dialog starts: the folder of the first shown curve's
     /// file, and "<that file's name>_export.csv". `None` when nothing is shown.
     fn export_default_location(&self) -> Option<(PathBuf, String)> {
+        self.save_default_location("_export.csv")
+    }
+
+    /// The folder of the first shown curve's file, and that file's name
+    /// followed by `suffix`. `None` when nothing is shown.
+    fn save_default_location(&self, suffix: &str) -> Option<(PathBuf, String)> {
         let curves = self.visible_curves();
         let first = curves.first()?;
         let dir = first.path.parent()?.to_path_buf();
-        Some((dir, format!("{}_export.csv", first.dataset.name)))
+        Some((dir, format!("{}{suffix}", first.dataset.name)))
     }
 
     fn export_dialog(&mut self) {
@@ -480,6 +487,75 @@ impl UvViewerApp {
         }
         if let Some(path) = dialog.save_file() {
             self.export_to(&path);
+        }
+    }
+
+    /// Whether any curve is shown, i.e. whether [`Self::visible_curves`] is
+    /// non-empty, without processing the curves.
+    fn any_curve_shown(&self) -> bool {
+        self.files
+            .iter()
+            .any(|f| f.visible && f.curves.iter().any(|c| c.visible))
+    }
+
+    /// The shown curves as the plot draws them (processed values, colours,
+    /// legend names, axis titles and legend setting). `None` when no curve is
+    /// shown.
+    fn figure(&self) -> Option<figure::Figure> {
+        let (x_title, y_title) = self.axis_titles()?;
+        let curves: Vec<figure::FigureCurve> = self
+            .visible_curves()
+            .into_iter()
+            .map(|curve| figure::FigureCurve {
+                name: curve.name,
+                points: curve.points,
+                color: curve.color,
+            })
+            .collect();
+        if curves.is_empty() {
+            return None;
+        }
+        Some(figure::Figure {
+            curves,
+            x_title,
+            y_title,
+            legend: self.show_legend,
+        })
+    }
+
+    /// Draws the shown curves to `path` (format by its extension); failures
+    /// go to the errors list. Runs on the UI thread, which a PNG can hold up
+    /// for about a second in a debug build.
+    fn export_figure_to(&mut self, path: &Path) {
+        let Some(figure) = self.figure() else {
+            self.errors.push(format!(
+                "{}: nothing to export, no curve is shown",
+                path.display()
+            ));
+            return;
+        };
+        if let Err(e) = figure::write_figure(path, &figure) {
+            self.errors.push(e);
+        }
+    }
+
+    /// Where the Export figure dialog starts: like the CSV export, named
+    /// "<file name>_figure.<first supported extension>".
+    fn figure_default_location(&self) -> Option<(PathBuf, String)> {
+        let ext = figure::EXTENSIONS.first()?;
+        self.save_default_location(&format!("_figure.{ext}"))
+    }
+
+    fn export_figure_dialog(&mut self) {
+        let mut dialog = rfd::FileDialog::new();
+        for ext in figure::EXTENSIONS {
+            dialog = dialog.add_filter(ext.to_ascii_uppercase(), &[ext]);
+        }
+        if let Some((dir, file_name)) = self.figure_default_location() {
+            dialog = dialog.set_directory(dir).set_file_name(file_name);
+        }
+        if let Some(path) = dialog.save_file() {
+            self.export_figure_to(&path);
         }
     }
 
@@ -632,7 +708,7 @@ impl eframe::App for UvViewerApp {
                         ui.close();
                         self.open_dialog();
                     }
-                    let can_export = !self.visible_curves().is_empty();
+                    let can_export = self.any_curve_shown();
                     if ui
                         .add_enabled(can_export, egui::Button::new("Export CSV…"))
                         .on_disabled_hover_text("No curve is shown")
@@ -640,6 +716,14 @@ impl eframe::App for UvViewerApp {
                     {
                         ui.close();
                         self.export_dialog();
+                    }
+                    if ui
+                        .add_enabled(can_export, egui::Button::new("Export figure…"))
+                        .on_disabled_hover_text("No curve is shown")
+                        .clicked()
+                    {
+                        ui.close();
+                        self.export_figure_dialog();
                     }
                     if ui.button("Close all").clicked() {
                         self.files.clear();
@@ -1166,6 +1250,116 @@ mod tests {
         assert_eq!(
             app.export_default_location(),
             Some((dir, "multi_spectra_export.csv".to_owned()))
+        );
+    }
+
+    /// File -> Export figure draws exactly the shown curves, with their plot
+    /// colours and legend names and the plot's axis titles.
+    #[test]
+    fn export_figure_writes_the_shown_curves() {
+        let tmp = TempCopies::empty("figure_shown");
+        let path = tmp.dir.join("out.svg");
+        let mut app = opened_single_and_multi();
+        app.files[1].curves[2].visible = false;
+        app.files[1].curves[4].color = Some(Color32::RED);
+        app.processing.normalize_kind = NormalizeKind::Max;
+
+        let figure = app.figure().expect("curves are shown");
+        let (x_title, y_title) = app.axis_titles().expect("files are open");
+        assert_eq!(
+            (figure.x_title.as_str(), figure.y_title.as_str()),
+            ("Wavelength / nm", "Normalized")
+        );
+        assert_eq!((&figure.x_title, &figure.y_title), (&x_title, &y_title));
+        assert!(figure.legend);
+        let expected: Vec<(String, Vec<[f64; 2]>, Color32)> = app
+            .visible_curves()
+            .into_iter()
+            .map(|c| (c.name, c.points, c.color))
+            .collect();
+        let got: Vec<(String, Vec<[f64; 2]>, Color32)> = figure
+            .curves
+            .iter()
+            .map(|c| (c.name.clone(), c.points.clone(), c.color))
+            .collect();
+        assert_eq!(got, expected);
+
+        app.export_figure_to(&path);
+        assert!(app.errors.is_empty(), "{:?}", app.errors);
+        let svg = std::fs::read_to_string(&path).expect("read back figure");
+        assert!(svg.contains("<svg"), "not an SVG file");
+        for (name, _, _) in &expected {
+            assert!(svg.contains(name.as_str()), "legend lacks {name:?}");
+        }
+        let hidden = format!("multi_spectra: {}", fixtures::multi::LABELS[2]);
+        assert!(!svg.contains(&hidden), "hidden curve {hidden:?} drawn");
+        assert!(svg.contains(&x_title) && svg.contains(&y_title));
+    }
+
+    /// The figure's legend follows "Show legend".
+    #[test]
+    fn export_figure_legend_follows_show_legend() {
+        let mut app = opened_single_and_multi();
+        app.show_legend = false;
+        assert!(!app.figure().expect("curves are shown").legend);
+    }
+
+    /// Failed figure writes are shown in the errors list instead of panicking.
+    #[test]
+    fn export_figure_failures_are_reported() {
+        let tmp = single_curve_copies("figure_fail", 1);
+        let mut app = opened_single_and_multi();
+
+        let txt = tmp.dir.join("out.txt");
+        app.export_figure_to(&txt);
+        assert_eq!(app.errors.len(), 1, "{:?}", app.errors);
+        assert!(!txt.exists());
+
+        // A path below a regular file.
+        let ext = figure::EXTENSIONS[0];
+        app.export_figure_to(&tmp.paths[0].join(format!("out.{ext}")));
+        assert_eq!(app.errors.len(), 2, "{:?}", app.errors);
+    }
+
+    /// With nothing shown the item is disabled; a call anyway writes nothing
+    /// and says why.
+    #[test]
+    fn export_figure_with_no_shown_curve_writes_nothing() {
+        let tmp = TempCopies::empty("figure_none");
+        let path = tmp.dir.join("out.svg");
+        let mut app = opened_single_and_multi();
+        assert!(app.any_curve_shown());
+        app.files[0].visible = false;
+        app.files[1]
+            .curves
+            .iter_mut()
+            .for_each(|c| c.visible = false);
+        assert!(!app.any_curve_shown());
+        assert!(app.visible_curves().is_empty());
+
+        app.export_figure_to(&path);
+        assert_eq!(app.errors.len(), 1, "{:?}", app.errors);
+        assert!(!path.exists());
+        assert_eq!(app.figure_default_location(), None);
+        assert!(!UvViewerApp::default().any_curve_shown());
+    }
+
+    /// The figure dialog starts where the CSV one does, with
+    /// "<file name>_figure.<first supported extension>" as the name.
+    #[test]
+    fn figure_dialog_defaults_follow_the_first_shown_file() {
+        let mut app = opened_single_and_multi();
+        app.files[0].visible = false;
+        let dir = testdata(fixtures::multi::FILE)
+            .parent()
+            .expect("fixture has a folder")
+            .to_path_buf();
+        assert_eq!(
+            app.figure_default_location(),
+            Some((
+                dir,
+                format!("multi_spectra_figure.{}", figure::EXTENSIONS[0])
+            ))
         );
     }
 
