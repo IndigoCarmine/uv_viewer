@@ -156,6 +156,56 @@ mod tests {
         assert!((p[10][1] - (1.0 - 1.9)).abs() < 1e-12);
     }
 
+    /// Asserts every y equals the original y minus `offset`, with no NaN.
+    fn assert_shifted_by(p: &[[f64; 2]], c: &Curve, offset: f64) {
+        for (got, orig) in ys(p).iter().zip(&c.y) {
+            assert!(
+                (got - (orig - offset)).abs() < 1e-12,
+                "got {got}, want {}",
+                orig - offset
+            );
+        }
+    }
+
+    #[test]
+    fn range_mean_without_points_subtracts_midpoint_value() {
+        let c = line_curve();
+        // No grid point (x step 10) lies at 45, so the baseline falls back to
+        // the interpolated y(45) = 1.45 instead of averaging nothing.
+        let p = apply(
+            &c,
+            &Baseline::RangeMean { lo: 45.0, hi: 45.0 },
+            &Normalize::None,
+        );
+        assert_shifted_by(&p, &c, 1.45);
+    }
+
+    #[test]
+    fn range_mean_reversed_range_without_points_uses_same_midpoint() {
+        let c = line_curve();
+        // lo > hi is reordered to 42..=48: no grid point inside, midpoint 45.
+        let p = apply(
+            &c,
+            &Baseline::RangeMean { lo: 48.0, hi: 42.0 },
+            &Normalize::None,
+        );
+        assert_shifted_by(&p, &c, 1.45);
+    }
+
+    #[test]
+    fn range_mean_outside_data_leaves_curve_unchanged() {
+        let c = line_curve();
+        let p = apply(
+            &c,
+            &Baseline::RangeMean {
+                lo: 200.0,
+                hi: 300.0,
+            },
+            &Normalize::None,
+        );
+        assert_eq!(ys(&p), c.y);
+    }
+
     #[test]
     fn two_point_flattens_a_sloped_line() {
         let c = line_curve();
