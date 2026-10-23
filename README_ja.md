@@ -183,6 +183,7 @@ cargo run
 - [`src/color.rs`](src/color.rs) — カラーマップ、単色用パレット、グラデーション上の位置。
 - [`src/export.rs`](src/export.rs) — 表示中の曲線の CSV 書き出し。
 - [`src/figure.rs`](src/figure.rs) — ruviz による表示中の曲線の図（PNG / SVG / PDF）の書き出し。
+- [`src/trace.rs`](src/trace.rs) — 複数列ファイルの温度トレース（各曲線の λ での値を列のラベルに対して並べたもの）と、その系列の色・軸タイトル。
 - [`src/app.rs`](src/app.rs) — アプリの状態、UI、永続化。
 
 ## 自分のアプリにする

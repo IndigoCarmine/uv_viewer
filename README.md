@@ -183,6 +183,7 @@ The code is split by concern:
 - [`src/color.rs`](src/color.rs) — colormaps, the single-colour palette and gradient positions.
 - [`src/export.rs`](src/export.rs) — CSV export of the shown curves.
 - [`src/figure.rs`](src/figure.rs) — figure export (PNG / SVG / PDF) of the shown curves with ruviz.
+- [`src/trace.rs`](src/trace.rs) — temperature trace of multi-column files: the value at λ of each curve against its column label, with the series colours and axis titles.
 - [`src/app.rs`](src/app.rs) — application state, user interface and persistence.
 
 ## Making it yours
