@@ -1,12 +1,12 @@
-//! Writing the displayed curves to an image file (PNG or SVG) with ruviz.
+//! Writing the displayed curves to an image file (PNG, SVG or PDF) with ruviz.
 //!
 //! [`write_figure`] takes plain data and a path, so it does not depend on the
 //! UI and the files it writes are checked by unit tests.
 //!
 //! ruviz decides nothing from the file name ([`ruviz::prelude::Plot::save`]
-//! always writes PNG, `export_svg` always SVG), so the format is chosen here
-//! from the extension, and an unknown extension is refused before anything
-//! is written.
+//! always writes PNG, `export_svg` always SVG, `save_pdf` always PDF), so the
+//! format is chosen here from the extension, and an unknown extension is
+//! refused before anything is written.
 
 use std::path::Path;
 
@@ -33,7 +33,7 @@ pub struct Figure {
 }
 
 /// File extensions [`write_figure`] accepts, lower case and without the dot.
-pub const EXTENSIONS: &[&str] = &["png", "svg"];
+pub const EXTENSIONS: &[&str] = &["png", "svg", "pdf"];
 
 /// Line width of every curve, the same as on screen.
 const LINE_WIDTH: f32 = 1.5;
@@ -42,6 +42,7 @@ const LINE_WIDTH: f32 = 1.5;
 enum Format {
     Png,
     Svg,
+    Pdf,
 }
 
 impl Format {
@@ -51,17 +52,18 @@ impl Format {
         match ext.as_str() {
             "png" => Some(Self::Png),
             "svg" => Some(Self::Svg),
+            "pdf" => Some(Self::Pdf),
             _ => None,
         }
     }
 }
 
-/// Draws `figure` and writes it to `path`, as PNG or SVG by its extension.
+/// Draws `figure` and writes it to `path`, as PNG, SVG or PDF by its extension.
 ///
 /// Non-finite points are left out; a curve without any finite point is not
-/// drawn. Fails, without writing, when the extension is neither `.png` nor
-/// `.svg` or when no curve has a finite point. Missing parent directories are
-/// created. On failure the error reads `{path}: {reason}`, like
+/// drawn. Fails, without writing, when the extension is not one of
+/// [`EXTENSIONS`] or when no curve has a finite point. Missing parent
+/// directories are created. On failure the error reads `{path}: {reason}`, like
 /// [`crate::jasco::load`].
 pub fn write_figure(path: &Path, figure: &Figure) -> Result<(), String> {
     let fail = |reason: String| format!("{}: {reason}", path.display());
@@ -109,6 +111,8 @@ pub fn write_figure(path: &Path, figure: &Figure) -> Result<(), String> {
     match format {
         Format::Png => plot.save(path),
         Format::Svg => plot.export_svg(path),
+        // ruviz's default page, 160 x 120 mm.
+        Format::Pdf => plot.save_pdf(path),
     }
     .map_err(|e| fail(e.to_string()))
 }
@@ -123,6 +127,7 @@ mod tests {
     use crate::processing::{self, Baseline, Normalize};
 
     const PNG_SIGNATURE: &[u8] = b"\x89PNG\r\n\x1a\n";
+    const PDF_SIGNATURE: &[u8] = b"%PDF-";
 
     /// A temporary directory removed when dropped (also when the test panics).
     struct TempDir(PathBuf);
@@ -209,6 +214,17 @@ mod tests {
     }
 
     #[test]
+    fn writes_fixture_as_pdf() {
+        let dir = TempDir::new("pdf");
+        let path = dir.path("figure.pdf");
+        write_figure(&path, &fixture_figure()).expect("write PDF");
+        let bytes = std::fs::read(&path).expect("read PDF");
+        assert!(bytes.starts_with(PDF_SIGNATURE), "not a PDF file");
+        // ruviz writes through a temporary sibling file; none may be left.
+        assert_eq!(dir.entries(), ["figure.pdf"]);
+    }
+
+    #[test]
     fn writes_fixture_as_svg_with_legend_and_axis_titles() {
         let dir = TempDir::new("svg");
         let path = dir.path("figure.svg");
@@ -237,10 +253,14 @@ mod tests {
         let figure = one_curve("a", vec![[1.0, 1.0], [2.0, 3.0]]);
         let png = dir.path("figure.PNG");
         let svg = dir.path("figure.Svg");
+        let pdf = dir.path("figure.PDF");
         write_figure(&png, &figure).expect("write .PNG");
         write_figure(&svg, &figure).expect("write .Svg");
+        write_figure(&pdf, &figure).expect("write .PDF");
         assert!(std::fs::read(&png).unwrap().starts_with(PNG_SIGNATURE));
         assert!(std::fs::read_to_string(&svg).unwrap().contains("<svg"));
+        assert!(std::fs::read(&pdf).unwrap().starts_with(PDF_SIGNATURE));
+        assert_eq!(dir.entries(), ["figure.PDF", "figure.PNG", "figure.Svg"]);
     }
 
     #[test]
@@ -262,7 +282,7 @@ mod tests {
             let err = write_figure(&path, &figure).expect_err("must refuse");
             assert!(err.starts_with(&path.display().to_string()), "{err}");
             assert!(err.contains("unsupported figure format"), "{err}");
-            assert!(err.contains(".png") && err.contains(".svg"), "{err}");
+            assert!(err.contains("(supported: .png / .svg / .pdf)"), "{err}");
         }
         assert!(dir.entries().is_empty(), "wrote {:?}", dir.entries());
     }

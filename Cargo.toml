@@ -17,10 +17,12 @@ serde = { version = "1.0", features = ["derive"] }
 egui_plot = "0.36"
 rfd = "0.15"
 encoding_rs = "0.8"
-# Figure export (PNG/SVG). The default ndarray_support and parallel (rayon) features are unused.
-ruviz = { version = "0.15.1", default-features = false }
+# Figure export (PNG/SVG, and PDF via the pdf feature). The default ndarray_support and
+# parallel (rayon) features are unused.
+ruviz = { version = "0.15.1", default-features = false, features = ["pdf"] }
 
 # Only used to decode the embedded window icon, so the heavy default codecs are off.
+# (ruviz's pdf feature still turns on jpeg/gif for image 0.25 through svg2pdf.)
 image = { version = "0.25", default-features = false, features = ["png"] }
 
 # Upstream winit/egui-winit do not implement native drag-and-drop on Wayland.
