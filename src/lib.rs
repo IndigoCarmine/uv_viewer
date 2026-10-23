@@ -6,6 +6,7 @@
 pub mod app;
 pub mod color;
 pub mod export;
+pub mod figure;
 #[cfg(test)]
 pub(crate) mod fixtures;
 pub mod jasco;
