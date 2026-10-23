@@ -65,6 +65,39 @@ The curve's value at a *Two-point* or *Value at x* position is interpolated line
 - Picking a colour for an individual curve overrides the file's colour mode; **↺** (or **Reset colors** for the whole file) goes back to the file's colours.
 - **Show legend** toggles the plot legend. The axis titles come from the first visible file.
 
+### Exporting CSV
+
+**File → Export CSV…** writes the shown curves to a CSV file, with the *Processing* settings applied: the values are the ones the plot draws, after baseline correction and normalisation.
+
+- A curve is exported when both its file's checkbox and its own checkbox are on. Hiding a curve by clicking its entry in the plot legend does not remove it from the export.
+- The menu item is disabled while no curve is shown.
+- The save dialog (filter *CSV*, `*.csv`) starts in the folder of the first shown curve's file, with `<that file's name>_export.csv` as the file name (`spectrum.txt` → `spectrum_export.csv`).
+- If the file cannot be written, the error is shown at the bottom of the side panel, like a file that fails to load.
+
+The layout is two columns, x and y, per curve, in the order the curves are drawn (file order in the list, then curve order within the file). The plot legend lists the names alphabetically, so its order can differ from the column order, for example for the temperature scans of a multi-column file.
+
+1. Row 1 — the curve's legend name in both of its columns: the file name without its extension, or `<file name>: <label>` for a curve of a multi-column file.
+2. Row 2 — the x and y titles of the curve's own file, derived from `XUNITS` / `YUNITS` as for the plot axes (*Normalized* for y while normalisation is on). The plot's axis titles follow the first visible file only, so when files with different units are shown together, these headers can differ from the plot's axis titles.
+3. Row 3 onwards — one point per row. Every curve keeps its own x values, so curves on different x grids stay paired with their x. Below the end of a curve shorter than the longest one, both of its cells are empty.
+
+Formatting:
+
+- Fields are separated by commas, and every line, including the last, ends with CRLF.
+- Numbers always use `.` as the decimal mark, whatever the system locale, are never written in exponent notation, and keep full precision (reading them back gives exactly the value the viewer had). NaN and infinite values become empty cells.
+- A name or header containing a comma, a double quote or a line break is enclosed in double quotes, with `"` doubled.
+- The file is UTF-8 with a byte order mark, so Excel on Japanese Windows shows Japanese file names correctly.
+
+To read it with pandas, use both header rows and the `utf-8-sig` encoding (which drops the byte order mark):
+
+```python
+import pandas as pd
+
+df = pd.read_csv("spectrum_export.csv", header=[0, 1], encoding="utf-8-sig")
+spectrum = df["spectrum"].dropna()  # the x and y columns of one curve, without empty cells (padding, NaN/inf)
+```
+
+The columns are then `(name, header)` pairs, such as `("spectrum", "Wavelength / nm")`.
+
 ### Saved state
 
 The open files and the settings are saved by eframe's `persistence` feature and restored on the next start: the file paths and their order, file and curve visibility, colour modes and curve colours, the processing settings and the legend toggle. Only the paths are stored, not the data, so the files are re-read from disk on startup. A file that can no longer be read is removed from the list and reported as an error. A file's per-curve settings are kept as long as it still has the same number of curves; otherwise they are reset.
@@ -92,6 +125,7 @@ The code is split by concern:
 - [`src/jasco.rs`](src/jasco.rs) — parser for the JASCO text export.
 - [`src/processing.rs`](src/processing.rs) — baseline correction and normalisation.
 - [`src/color.rs`](src/color.rs) — colormaps, the single-colour palette and gradient positions.
+- [`src/export.rs`](src/export.rs) — CSV export of the shown curves.
 - [`src/app.rs`](src/app.rs) — application state, user interface and persistence.
 
 ## Making it yours
