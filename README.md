@@ -25,7 +25,7 @@ The viewer reads the text export of JASCO spectrometers:
 - **Encoding** — CP932 (Shift-JIS).
 - **Header** — `KEY<TAB>VALUE` lines up to a line reading `XYDATA`. `XUNITS` and `YUNITS` become the axis titles (`NANOMETERS` → *Wavelength / nm*, `ABSORBANCE` → *Absorbance*, `Temperature…` → *Temperature / °C*; any other unit is shown as written). A file without an `XYDATA` line, or without any numeric data after it, is rejected with an error.
 - **Single column** — one `x<TAB>y` pair per line: one curve, named after the file.
-- **Multi column** — a row that starts with a tab and lists one label per scan (usually the temperature, e.g. `<TAB>110<TAB>104.99…`), followed by `x<TAB>y1<TAB>y2…` lines: one curve per column, named by its label.
+- **Multi column** — a row that starts with a tab and lists one label per scan (usually the temperature, e.g. `<TAB>85<TAB>70…`), followed by `x<TAB>y1<TAB>y2…` lines: one curve per column, named by its label.
 - The data ends at the first empty line or `#####` line, so a trailing `##### Extended Information` section is ignored.
 
 The x values can be wavelengths or anything else the instrument exports, such as temperatures in a single-wavelength temperature scan.
@@ -34,7 +34,7 @@ The x values can be wavelengths or anything else the instrument exports, such as
 
 ### Opening files
 
-- **File → Open…**, or the **Open…** button next to *Files* in the side panel, opens a file dialog (filter *JASCO text*, `*.txt`; several files can be selected at once).
+- **File → Open…**, or the **Open…** button next to *Files* in the side panel, opens a file dialog (filters *JASCO text*, `*.txt`, and *All files*; several files can be selected at once).
 - Files can also be dropped onto the window.
 - A file that is already open is not opened a second time. Files that fail to load are reported as error messages at the bottom of the side panel until you click **Dismiss**.
 - **File → Close all** closes every file; the **✖** button in a file's row closes just that file.
@@ -52,7 +52,7 @@ The *Processing* settings apply to every curve, baseline first, then normalisati
   - **Max = 1** — divides by the maximum of the (baseline-corrected) curve.
   - **Value at x = 1** — divides by the curve's value at the given x.
 
-The curve's value at a *Two-point* or *Value at x* position is interpolated linearly, so the position does not have to match a data point. When a baseline or normalisation x lies outside a curve's x range, that step is skipped for that curve instead of hiding it, and normalisation is also skipped when the divisor is (almost) zero. While normalisation is on, the y axis is titled *Normalized*.
+The curve's value at a *Two-point* or *Value at x* position is interpolated linearly, so the position does not have to match a data point. A *Two-point* or *Value at x* position outside a curve's x range skips that step for that curve (the curve is still shown). *Range mean* averages whichever points fall in the range, even if the range extends past the curve, and is skipped only when no point falls in the range and its middle is also outside the curve. Normalisation is also skipped when the divisor is (almost) zero. While normalisation is on, the y axis is titled *Normalized*.
 
 ### Files, curves and colours
 
