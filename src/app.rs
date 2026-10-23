@@ -107,11 +107,12 @@ struct LoadedFile {
 }
 
 impl LoadedFile {
-    fn new(dataset: Dataset, file_index: usize) -> Self {
+    /// `single_color` is the colour a single-curve file starts with.
+    fn new(dataset: Dataset, single_color: Color32) -> Self {
         let color_mode = if dataset.is_multi() {
             ColorMode::Gradient(Colormap::Coolwarm)
         } else {
-            ColorMode::Single(color::palette(file_index))
+            ColorMode::Single(single_color)
         };
         let mut file = Self {
             path: dataset.path.clone(),
@@ -212,8 +213,15 @@ impl UvViewerApp {
             }
             match jasco::load(&path) {
                 Ok(dataset) => {
-                    let index = self.files.len();
-                    self.files.push(LoadedFile::new(dataset, index));
+                    // Avoid the colours the open files already show, rather than
+                    // going by list position, which repeats after a close or move.
+                    // Per-curve overrides are deliberate picks and do not count.
+                    let in_use = self.files.iter().filter_map(|f| match f.color_mode {
+                        ColorMode::Single(c) => Some(c),
+                        ColorMode::Gradient(_) => None,
+                    });
+                    let single_color = color::next_single(in_use);
+                    self.files.push(LoadedFile::new(dataset, single_color));
                 }
                 Err(e) => self.errors.push(e),
             }
@@ -626,6 +634,57 @@ mod tests {
         app.move_file(0, 0);
         app.move_file(0, 1);
         assert_eq!(colors(&app), before);
+    }
+
+    /// Copies the single-curve fixture to `count` distinct paths in a per-test
+    /// temporary directory, since opening the same path twice is ignored.
+    fn single_curve_copies(test: &str, count: usize) -> Vec<PathBuf> {
+        let dir = std::env::temp_dir().join(format!("uv_viewer-{test}-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        (0..count)
+            .map(|i| {
+                let path = dir.join(format!("single_{i}.txt"));
+                std::fs::copy(testdata(fixtures::single::FILE), &path).expect("copy fixture");
+                path
+            })
+            .collect()
+    }
+
+    fn single_colors(app: &UvViewerApp) -> Vec<Color32> {
+        app.files
+            .iter()
+            .map(|f| match f.color_mode {
+                ColorMode::Single(c) => c,
+                ColorMode::Gradient(_) => panic!("expected a single-curve file"),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn closing_a_file_does_not_hand_out_a_colour_in_use() {
+        let paths = single_curve_copies("close", 3);
+        let mut app = UvViewerApp::default();
+        app.open_paths(paths[..2].to_vec());
+        app.files.remove(0);
+        app.open_paths([paths[2].clone()]);
+
+        let colors = single_colors(&app);
+        assert_eq!(colors.len(), 2);
+        assert_ne!(colors[0], colors[1]);
+    }
+
+    #[test]
+    fn reordering_files_does_not_hand_out_a_colour_in_use() {
+        let paths = single_curve_copies("reorder", 3);
+        let mut app = UvViewerApp::default();
+        app.open_paths(paths[..2].to_vec());
+        app.move_file(1, 0);
+        app.files.remove(1);
+        app.open_paths([paths[2].clone()]);
+
+        let colors = single_colors(&app);
+        assert_eq!(colors.len(), 2);
+        assert_ne!(colors[0], colors[1]);
     }
 
     #[test]

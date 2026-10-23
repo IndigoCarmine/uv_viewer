@@ -61,7 +61,7 @@ The curve's value at a *Two-point* or *Value at x* position is interpolated line
 - Colour mode per file:
   - **Gradient** — curves are coloured along a colormap: *Viridis*, *Jet*, *Coolwarm* or *Blue → Red*. When every curve label is a number (such as the scan temperatures of a multi-column file), a curve's position on the colormap follows that number, so the hottest scan always gets the top of the colormap whether the run was heated or cooled. Otherwise the curves are spread evenly in file order.
   - **Single** — every curve of the file gets one colour.
-- Multi-column files start in *Gradient* mode with *Coolwarm*; single-curve files get a colour from an 8-colour palette, picked by how many files are already open.
+- Multi-column files start in *Gradient* mode with *Coolwarm*; single-curve files get the first colour of an 8-colour palette that no open file is using (once all 8 are taken, the least-used one).
 - Picking a colour for an individual curve overrides the file's colour mode; **↺** (or **Reset colors** for the whole file) goes back to the file's colours.
 - **Show legend** toggles the plot legend. The axis titles come from the first visible file.
 
