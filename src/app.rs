@@ -418,15 +418,20 @@ impl UvViewerApp {
         });
     }
 
-    /// The plot's x and y axis titles, taken from the first visible file (or
-    /// the first file when none is visible); `None` when no file is open.
+    /// The plot's x and y axis titles, taken from the file of the first shown
+    /// curve (or the first file when no curve is shown); `None` when no file
+    /// is open.
     fn axis_titles(&self) -> Option<(String, String)> {
-        let first = self
-            .files
-            .iter()
-            .find(|f| f.visible)
-            .or(self.files.first())?;
+        let first = self.first_shown_file().or(self.files.first())?;
         Some(axis_titles(&first.dataset, self.processing.normalize()))
+    }
+
+    /// The file of the first curve [`Self::visible_curves`] yields: the first
+    /// checked file with a checked curve. Found without processing the curves.
+    fn first_shown_file(&self) -> Option<&LoadedFile> {
+        self.files
+            .iter()
+            .find(|f| f.visible && f.curves.iter().any(|c| c.visible))
     }
 
     /// The shown curves as they are written to CSV, headed like the plot axes.
@@ -474,8 +479,7 @@ impl UvViewerApp {
     /// The folder of the first shown curve's file, and that file's name
     /// followed by `suffix`. `None` when nothing is shown.
     fn save_default_location(&self, suffix: &str) -> Option<(PathBuf, String)> {
-        let curves = self.visible_curves();
-        let first = curves.first()?;
+        let first = self.first_shown_file()?;
         let dir = first.path.parent()?.to_path_buf();
         Some((dir, format!("{}{suffix}", first.dataset.name)))
     }
@@ -493,9 +497,7 @@ impl UvViewerApp {
     /// Whether any curve is shown, i.e. whether [`Self::visible_curves`] is
     /// non-empty, without processing the curves.
     fn any_curve_shown(&self) -> bool {
-        self.files
-            .iter()
-            .any(|f| f.visible && f.curves.iter().any(|c| c.visible))
+        self.first_shown_file().is_some()
     }
 
     /// The shown curves as the plot draws them (processed values, colours,
@@ -1359,6 +1361,40 @@ mod tests {
             Some((
                 dir,
                 format!("multi_spectra_figure.{}", figure::EXTENSIONS[0])
+            ))
+        );
+    }
+
+    /// The axis titles come from the first file with a shown curve: a file
+    /// left checked but with every curve hidden does not lend its units to a
+    /// plot or figure of another file's curves.
+    #[test]
+    fn axis_titles_follow_the_first_shown_curve() {
+        let mut app = UvViewerApp::default();
+        app.open_paths([
+            testdata(fixtures::single::FILE),
+            testdata(fixtures::temperature::FILE),
+        ]);
+        assert!(app.errors.is_empty(), "{:?}", app.errors);
+        app.files[0]
+            .curves
+            .iter_mut()
+            .for_each(|c| c.visible = false);
+        assert!(app.files[0].visible);
+
+        let expected = axis_titles(&app.files[1].dataset, app.processing.normalize());
+        assert_eq!(expected.0, "Temperature / °C");
+        assert_eq!(app.axis_titles(), Some(expected.clone()));
+        let figure = app.figure().expect("the temperature curve is shown");
+        assert_eq!((figure.x_title, figure.y_title), expected);
+
+        // With no curve shown the titles fall back to the first file.
+        app.files[1].visible = false;
+        assert_eq!(
+            app.axis_titles(),
+            Some(axis_titles(
+                &app.files[0].dataset,
+                app.processing.normalize()
             ))
         );
     }
