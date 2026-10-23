@@ -171,10 +171,15 @@ impl Default for UvViewerApp {
     }
 }
 
+/// Enlarges the whole UI by 10% on top of the OS display scaling.
+fn apply_ui_zoom(ctx: &egui::Context) {
+    ctx.set_zoom_factor(1.1);
+}
+
 impl UvViewerApp {
     /// Builds the app, restoring persisted state when eframe has some.
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
-        cc.egui_ctx.set_pixels_per_point(1.1);
+        apply_ui_zoom(&cc.egui_ctx);
 
         let mut app: Self = cc
             .storage
@@ -565,6 +570,27 @@ mod tests {
         Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("testdata")
             .join(name)
+    }
+
+    /// The 1.1x zoom must be relative to the OS scaling, not an absolute pixel
+    /// scale that shrinks the UI on HiDPI displays.
+    #[test]
+    fn ui_zoom_is_relative_to_native_scaling() {
+        let ctx = egui::Context::default();
+        let mut input = egui::RawInput::default();
+        input
+            .viewports
+            .get_mut(&egui::ViewportId::ROOT)
+            .expect("root viewport")
+            .native_pixels_per_point = Some(1.5);
+
+        // eframe has already fed the native scale in before the app is built.
+        let _ = ctx.run_ui(input.clone(), |_| {});
+        apply_ui_zoom(&ctx);
+        let _ = ctx.run_ui(input, |_| {});
+
+        assert_eq!(ctx.zoom_factor(), 1.1);
+        assert!((ctx.pixels_per_point() - 1.65).abs() < 1e-6);
     }
 
     #[test]
