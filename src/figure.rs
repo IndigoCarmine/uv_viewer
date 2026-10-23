@@ -8,7 +8,9 @@
 //! format is chosen here from the extension, and an unknown extension is
 //! refused before anything is written.
 
-use std::path::Path;
+use std::ffi::OsString;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use egui::Color32;
 use ruviz::prelude::{Color, Plot};
@@ -162,8 +164,10 @@ impl Format {
 /// Non-finite points are left out; a curve without any finite point is not
 /// drawn. Fails, without writing, when the extension is not one of
 /// [`EXTENSIONS`] or when no curve has a finite point. Missing parent
-/// directories are created. On failure the error reads `{path}: {reason}`, like
-/// [`crate::jasco::load`].
+/// directories are created. An existing file at `path` is replaced; when it
+/// cannot be (it is read-only, or held open on Windows), it is left as it was
+/// and no other file is left behind. On failure the error reads
+/// `{path}: {reason}`, like [`crate::jasco::load`].
 pub fn write_figure(path: &Path, figure: &Figure) -> Result<(), String> {
     let fail = |reason: String| format!("{}: {reason}", path.display());
     let format = Format::of(path).ok_or_else(|| {
@@ -214,19 +218,47 @@ pub fn write_figure(path: &Path, figure: &Figure) -> Result<(), String> {
         plot = plot.legend_best();
     }
 
-    match format {
-        Format::Png => plot.save(path),
-        Format::Svg => plot.export_svg(path),
+    // ruviz writes through a temporary sibling of the path it is given and
+    // keeps that file when the final replace fails (on Windows, for a
+    // read-only destination or one another program holds open), so it would
+    // pile up next to the user's figure on every retry. ruviz is therefore
+    // given a new path of ours, which its replace never fails on, and that
+    // file is moved over `path` here and removed if anything fails.
+    let temp = temp_path(path);
+    let result = match format {
+        Format::Png => plot.save(&temp),
+        Format::Svg => plot.export_svg(&temp),
         // ruviz's default page, 160 x 120 mm.
-        Format::Pdf => plot.save_pdf(path),
+        Format::Pdf => plot.save_pdf(&temp),
     }
-    .map_err(|e| fail(e.to_string()))
+    .map_err(|e| e.to_string())
+    .and_then(|()| std::fs::rename(&temp, path).map_err(|e| e.to_string()));
+    if result.is_err() {
+        // The write error is what is reported; the file may not even exist.
+        let _ = std::fs::remove_file(&temp);
+    }
+    result.map_err(fail)
+}
+
+/// A new path in the directory of `path` for the figure to be written to
+/// before it is moved over `path`: `.{file name}.uv-viewer-{pid}-{n}.tmp`,
+/// with `n` counting the calls in this process. Being in the same directory,
+/// the move is a rename on one volume.
+fn temp_path(path: &Path) -> PathBuf {
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    let mut name = OsString::from(".");
+    // Always present: a path with an extension has a file name.
+    name.push(path.file_name().unwrap_or_default());
+    name.push(format!(
+        ".uv-viewer-{}-{}.tmp",
+        std::process::id(),
+        NEXT.fetch_add(1, Ordering::Relaxed)
+    ));
+    path.with_file_name(name)
 }
 
 #[cfg(test)]
 mod tests {
-    use std::path::PathBuf;
-
     use super::*;
     use crate::fixtures;
     use crate::jasco;
@@ -655,5 +687,105 @@ mod tests {
             assert!(err.starts_with(&path.display().to_string()), "{err}");
         }
         assert!(dir.entries().is_empty(), "wrote {:?}", dir.entries());
+    }
+
+    #[test]
+    fn existing_figure_is_replaced() {
+        let dir = TempDir::new("replace");
+        let figure = one_curve("a", vec![[1.0, 1.0], [2.0, 3.0]]);
+        for name in ["figure.png", "figure.svg", "figure.pdf"] {
+            let path = dir.path(name);
+            std::fs::write(&path, b"old").expect("write old file");
+            write_figure(&path, &figure).expect("replace figure");
+            assert_ne!(std::fs::read(&path).unwrap(), b"old", "{name} not replaced");
+        }
+        assert!(
+            std::fs::read(dir.path("figure.png"))
+                .unwrap()
+                .starts_with(PNG_SIGNATURE)
+        );
+        assert!(
+            std::fs::read_to_string(dir.path("figure.svg"))
+                .unwrap()
+                .contains("<svg")
+        );
+        assert!(
+            std::fs::read(dir.path("figure.pdf"))
+                .unwrap()
+                .starts_with(PDF_SIGNATURE)
+        );
+        assert_eq!(dir.entries(), ["figure.pdf", "figure.png", "figure.svg"]);
+    }
+
+    /// Makes a file read-only, and writable again when dropped (also when the
+    /// test panics), so that [`TempDir`] can remove it. Declare it after the
+    /// [`TempDir`] so that it is dropped first.
+    #[cfg(windows)]
+    struct ReadOnly(PathBuf);
+
+    #[cfg(windows)]
+    impl ReadOnly {
+        fn new(path: PathBuf) -> Self {
+            Self::set(&path, true);
+            ReadOnly(path)
+        }
+
+        fn set(path: &Path, readonly: bool) {
+            let mut permissions = std::fs::metadata(path).expect("metadata").permissions();
+            permissions.set_readonly(readonly);
+            std::fs::set_permissions(path, permissions).expect("set permissions");
+        }
+    }
+
+    #[cfg(windows)]
+    impl Drop for ReadOnly {
+        fn drop(&mut self) {
+            Self::set(&self.0, false);
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn read_only_destination_is_an_error_that_leaves_no_temporary_file() {
+        let dir = TempDir::new("read-only");
+        let figure = one_curve("a", vec![[1.0, 1.0], [2.0, 3.0]]);
+        let names = ["ro.pdf", "ro.png", "ro.svg"];
+        let _guards: Vec<ReadOnly> = names
+            .iter()
+            .map(|name| {
+                let path = dir.path(name);
+                std::fs::write(&path, b"old").expect("write old file");
+                ReadOnly::new(path)
+            })
+            .collect();
+        for name in names {
+            let path = dir.path(name);
+            let err = write_figure(&path, &figure).expect_err("must fail");
+            assert!(err.starts_with(&path.display().to_string()), "{err}");
+            assert_eq!(std::fs::read(&path).unwrap(), b"old", "{name} changed");
+        }
+        assert_eq!(dir.entries(), names);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn locked_destination_is_an_error_that_leaves_no_temporary_file() {
+        use std::os::windows::fs::OpenOptionsExt;
+
+        let dir = TempDir::new("locked");
+        let path = dir.path("locked.png");
+        std::fs::write(&path, b"old").expect("write old file");
+        // Opened with no sharing, as some viewers keep a figure open.
+        let handle = std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(0)
+            .open(&path)
+            .expect("open without sharing");
+        let err = write_figure(&path, &one_curve("a", vec![[1.0, 1.0], [2.0, 3.0]]))
+            .expect_err("must fail");
+        drop(handle);
+        assert!(err.starts_with(&path.display().to_string()), "{err}");
+        assert_eq!(std::fs::read(&path).unwrap(), b"old");
+        assert_eq!(dir.entries(), ["locked.png"]);
     }
 }
