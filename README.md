@@ -52,7 +52,7 @@ The *Processing* settings apply to every curve, baseline first, then normalisati
   - **Max = 1** — divides by the maximum of the (baseline-corrected) curve.
   - **Value at x = 1** — divides by the curve's value at the given x.
 
-The curve's value at a *Two-point* or *Value at x* position is interpolated linearly, so the position does not have to match a data point. A *Two-point* or *Value at x* position outside a curve's x range skips that step for that curve (the curve is still shown). *Range mean* averages whichever points fall in the range, even if the range extends past the curve, and is skipped only when no point falls in the range and its middle is also outside the curve. Normalisation is also skipped when the divisor is (almost) zero. While normalisation is on, the y axis is titled *Normalized*.
+The curve's value at a *Two-point* or *Value at x* position is interpolated linearly, so the position does not have to match a data point. A *Two-point* or *Value at x* position outside a curve's x range skips that step for that curve (the curve is still shown). *Range mean* averages whichever points fall in the range, even if the range extends past the curve, and is skipped only when no point falls in the range and its middle is also outside the curve. Normalisation is also skipped when the divisor is (almost) zero, and *Max = 1* is not applied to a curve whose maximum is not positive (dividing by it would flip the curve). While normalisation is on, the y axis is titled *Normalized*.
 
 ### Files, curves and colours
 
