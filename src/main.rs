@@ -38,6 +38,11 @@ fn main() -> eframe::Result<()> {
     eframe::run_native(
         APP_NAME,
         options,
-        Box::new(|cc| Ok(Box::new(UvViewerApp::new(cc)))),
+        Box::new(|cc| {
+            Ok(Box::new(UvViewerApp::with_args(
+                cc,
+                std::env::args_os().skip(1),
+            )))
+        }),
     )
 }

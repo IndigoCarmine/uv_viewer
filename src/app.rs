@@ -1,5 +1,6 @@
 //! The application state and its per-frame update logic.
 
+use std::ffi::OsString;
 use std::path::PathBuf;
 
 use egui::{Color32, RichText};
@@ -188,6 +189,39 @@ impl UvViewerApp {
             .unwrap_or_default();
         app.reload_files();
         app
+    }
+
+    /// Like [`Self::new`], then opens the files named on the command line
+    /// (e.g. from "Open with", a file dropped on the executable, or the
+    /// desktop entry's `%F`). `args` excludes the program name.
+    pub fn with_args(
+        cc: &eframe::CreationContext<'_>,
+        args: impl IntoIterator<Item = OsString>,
+    ) -> Self {
+        let mut app = Self::new(cc);
+        app.open_startup_args(args);
+        app
+    }
+
+    /// Opens command-line arguments on top of the restored state.
+    ///
+    /// The app takes no options, so arguments starting with `-` are skipped
+    /// instead of being reported as missing files: old macOS Finder passes
+    /// `-psn_...`, and launchers pass absolute paths, which never start with
+    /// `-` (a file named like that can still be given as `./-name`).
+    fn open_startup_args(&mut self, args: impl IntoIterator<Item = OsString>) {
+        let paths = args
+            .into_iter()
+            .filter(|arg| !arg.as_encoded_bytes().starts_with(b"-"))
+            .map(|arg| {
+                let path = PathBuf::from(arg);
+                // Persisted paths are reloaded next session, possibly from
+                // another working directory. `absolute` only fails for an empty
+                // path or an unreadable working directory; then the path is kept
+                // as given and loading it reports the problem.
+                std::path::absolute(&path).unwrap_or(path)
+            });
+        self.open_paths(paths);
     }
 
     /// Re-reads every persisted file from disk, dropping the ones that are gone.
@@ -708,6 +742,61 @@ mod tests {
         let colors = single_colors(&app);
         assert_eq!(colors.len(), 2);
         assert_ne!(colors[0], colors[1]);
+    }
+
+    /// Startup arguments are opened on top of the restored state, through the
+    /// same duplicate check and error reporting as the Open dialog.
+    #[test]
+    fn startup_args_open_after_restoring_state() {
+        let mut saved = UvViewerApp::default();
+        saved.open_paths([testdata(fixtures::multi::FILE)]);
+        let json = serde_json::to_string(&saved).expect("serialize");
+        let mut app: UvViewerApp = serde_json::from_str(&json).expect("deserialize");
+        app.reload_files();
+
+        app.open_startup_args([
+            testdata(fixtures::single::FILE).into_os_string(),
+            testdata("does_not_exist.txt").into_os_string(),
+            // Already restored: must not be added a second time.
+            testdata(fixtures::multi::FILE).into_os_string(),
+        ]);
+
+        let paths: Vec<_> = app.files.iter().map(|f| f.path.clone()).collect();
+        assert_eq!(
+            paths,
+            [
+                testdata(fixtures::multi::FILE),
+                testdata(fixtures::single::FILE)
+            ]
+        );
+        assert_eq!(app.files[1].dataset.curves.len(), 1);
+        assert_eq!(app.errors.len(), 1);
+    }
+
+    /// Option-like arguments (the app has none; old macOS Finder passes
+    /// `-psn_...`) are skipped rather than reported as missing files.
+    #[test]
+    fn startup_args_skip_option_like_arguments() {
+        let mut app = UvViewerApp::default();
+        app.open_startup_args(["-psn_0_12345".into(), "--help".into()]);
+        assert!(app.files.is_empty());
+        assert!(app.errors.is_empty());
+    }
+
+    /// A relative argument is stored as an absolute path, so it still loads
+    /// when the next session starts in another directory, and it matches the
+    /// same file restored under its absolute path.
+    #[test]
+    fn relative_startup_args_are_made_absolute() {
+        // `cargo test` runs from the package root.
+        let relative = Path::new("testdata").join(fixtures::single::FILE);
+        let mut app = UvViewerApp::default();
+        app.open_startup_args([relative.into_os_string()]);
+        app.open_paths([testdata(fixtures::single::FILE)]);
+
+        assert_eq!(app.files.len(), 1);
+        assert!(app.files[0].path.is_absolute());
+        assert!(app.errors.is_empty());
     }
 
     #[test]
