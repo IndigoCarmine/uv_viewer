@@ -42,36 +42,50 @@ const LINE_WIDTH: f32 = 1.5;
 //
 // Axis titles and legend names come from the input file (its XUNITS / YUNITS
 // values and column label row) without any length or count limit, and the
-// figure is written on the UI thread. ruviz's PDF export is slow in that text:
+// figure is written on the UI thread. ruviz's export is slow in that text:
 // super-linear in the length of one text (about quadratic, 0.6 s for 25 000
-// characters, 33 s for 200 000) and, in the legend, about 0.9 ms per entry
-// plus 0.15 ms per CJK character (ASCII is far cheaper), whatever the number
-// of curves. All timings are release builds of ruviz 0.15.1 writing PDF. The
-// three limits below bound the worst case and leave every real figure
-// untouched: 5000 curves with CJK names of 30, 100 or 1000 characters and
-// both axis titles 100 000 CJK characters long are written in 0.58-0.63 s
-// (1000 curves with 200-character CJK names took 34 s without the legend
-// limits, 0.54 s with them).
+// characters, 33 s for 200 000) and, in the legend, linear in the number of
+// entries and of characters at a cost that depends on the characters. The
+// most expensive are characters the fonts have no glyph for, such as
+// unassigned code points (U+3FF00..) and, close behind, emoji: about 3 ms per
+// legend entry and 1 ms per character. CJK Extension B and varied
+// (non-repeating) common CJK cost less, ASCII almost nothing; the numbers for
+// each are below. All timings are PDF, release build, ruviz 0.15.1.
+//
+// The three limits below were chosen by timing [`write_figure`] at them, with
+// both axis titles 100 000 characters long (so cut to [`MAX_TEXT_CHARS`]),
+// curves of 300 points, and every curve named with 1, 12, 13, 30, 100 or 1000
+// characters of one class: so the legend is either [`MAX_LEGEND_ENTRIES`]
+// short entries, or as many entries as fit in [`MAX_LEGEND_CHARS`]. Slowest
+// of those per class, with 100 curves: unassigned 0.82 s, emoji 0.69 s, CJK
+// Extension B 0.37 s, varied CJK 0.15 s, ASCII 0.06 s. With 1000 curves:
+// unassigned 1.25 s, emoji 1.03 s, CJK Extension B 0.71 s, varied CJK 0.50 s,
+// ASCII 0.47 s; of that, about 0.38 s is drawing the 300 000 points, whatever
+// the text.
+//
+// The price is that a figure with more than 40 curves, or with long names
+// (for example more than 20 of 25 characters), lists only its first curves in
+// the legend; the others are drawn without a legend entry, with no warning.
 
 /// Longest axis title or legend name, in characters, that is handed to ruviz;
 /// [`figure_text`] cuts longer text to this length, ending in an ellipsis.
 ///
 /// Real units and labels are a few dozen characters, and the 640 px wide
 /// figure holds only about 90 average Latin characters of ruviz's 13.9 px
-/// label font (about 45 CJK ones), so nothing readable is cut. One text this
-/// long takes about 20 ms.
+/// label font (about 45 CJK ones), so nothing readable is cut.
 const MAX_TEXT_CHARS: usize = 100;
 
 /// Most legend entries handed to ruviz; [`legend_labels`] leaves the curves
-/// after them without a label, so they are drawn but not listed. 100
-/// one-character CJK entries take 0.1 s (1000 take 0.94 s).
-const MAX_LEGEND_ENTRIES: usize = 100;
+/// after them without a label, so they are drawn but not listed. ruviz's
+/// legend runs off the figure well before this many entries.
+const MAX_LEGEND_ENTRIES: usize = 40;
 
 /// Most characters, summed over all legend entries, handed to ruviz;
 /// [`legend_labels`] stops labelling at the first entry that would go past
-/// it. 3000 CJK characters take about 0.45 s (100 entries of 30: 0.54 s; 50 of
-/// 60: 0.53 s), against 34 s for 1000 entries of 200 without this budget.
-const MAX_LEGEND_CHARS: usize = 3000;
+/// it. Without this budget, 1000 curves with 100 entries of 10 unassigned code
+/// points took 2.0 s; with it, the slowest case at the limits is the 1.25 s
+/// above, 0.38 s of it the curves.
+const MAX_LEGEND_CHARS: usize = 500;
 
 /// Marks the end of a text cut by [`figure_text`].
 const ELLIPSIS: char = '\u{2026}';
@@ -553,13 +567,53 @@ mod tests {
         assert_eq!(assert_legend_bounded(&labels), MAX_LEGEND_ENTRIES);
 
         // A name that does not fit ends the labels, even when a later, shorter
-        // one would still fit: 30 x 99 = 2970, then 100 does not fit, 1 would.
-        let mut names = vec!["合".repeat(99); 30];
+        // one would still fit: n names of `len`, then one of MAX_TEXT_CHARS
+        // that goes past the budget, then one character that would fit.
+        let len = MAX_TEXT_CHARS - 1;
+        let n = MAX_LEGEND_CHARS / len;
+        assert!(n + 2 <= MAX_LEGEND_ENTRIES);
+        assert!(n * len + MAX_TEXT_CHARS > MAX_LEGEND_CHARS);
+        assert!(n * len < MAX_LEGEND_CHARS);
+        let mut names = vec!["合".repeat(len); n];
         names.push("合".repeat(MAX_TEXT_CHARS));
         names.push("合".into());
         let labels = legend_labels(names.iter().map(String::as_str));
-        assert_eq!(assert_legend_bounded(&labels), 30);
-        assert_eq!(labels.len(), 32);
+        assert_eq!(assert_legend_bounded(&labels), n);
+        assert_eq!(labels.len(), n + 2);
+    }
+
+    #[test]
+    fn curves_past_the_legend_limit_add_no_legend_entry() {
+        let figure = |curves: usize| Figure {
+            curves: (0..curves)
+                .map(|k| FigureCurve {
+                    name: format!("c{k}"),
+                    // The same points, so the axes and ticks do not change.
+                    points: vec![[1.0, 1.0], [2.0, 3.0]],
+                    color: Color32::RED,
+                })
+                .collect(),
+            x_title: "x".into(),
+            y_title: "y".into(),
+            legend: true,
+        };
+        let dir = TempDir::new("legend-entries");
+        let svg_of = |figure: &Figure, name: &str| {
+            let path = dir.path(name);
+            write_figure(&path, figure).expect("write SVG");
+            std::fs::read_to_string(&path).expect("read SVG")
+        };
+        let listed = svg_of(&figure(MAX_LEGEND_ENTRIES), "listed.svg");
+        let more = svg_of(&figure(MAX_LEGEND_ENTRIES + 5), "more.svg");
+        let last = format!(">c{}<", MAX_LEGEND_ENTRIES - 1);
+        assert!(more.contains(&last), "SVG lacks the last listed entry");
+        assert!(!more.contains(&format!(">c{MAX_LEGEND_ENTRIES}<")));
+        // A curve given an empty label would still add an (empty) text.
+        assert_eq!(
+            more.matches("<text").count(),
+            listed.matches("<text").count(),
+            "curves past the limit changed the legend"
+        );
     }
 
     #[test]
