@@ -238,6 +238,34 @@ mod tests {
     }
 
     #[test]
+    fn normalize_max_leaves_all_zero_curve_unchanged() {
+        // The maximum is 0; dividing by it would turn every point into NaN.
+        let c = Curve {
+            label: "t".into(),
+            x: vec![3.0, 2.0, 1.0],
+            y: vec![0.0, 0.0, 0.0],
+        };
+        let p = apply(&c, &Baseline::None, &Normalize::Max);
+        assert_eq!(ys(&p), c.y);
+    }
+
+    #[test]
+    fn normalize_at_x_on_two_point_anchor_keeps_baseline_result() {
+        // The two-point baseline passes exactly through the curve at x = 3, so
+        // the value there is 0 after correction: [0, 3.5, 0]. Dividing by it
+        // would give NaN and inf, so normalisation must be skipped.
+        let c = Curve {
+            label: "t".into(),
+            x: vec![3.0, 2.0, 1.0],
+            y: vec![1.0, 5.0, 2.0],
+        };
+        let baseline = Baseline::TwoPoint { x1: 3.0, x2: 1.0 };
+        let p = apply(&c, &baseline, &Normalize::AtX(3.0));
+        assert!(ys(&p).iter().all(|y| y.is_finite()), "got {p:?}");
+        assert_eq!(p, apply(&c, &baseline, &Normalize::None));
+    }
+
+    #[test]
     fn normalize_at_x_runs_after_baseline() {
         let c = line_curve();
         let p = apply(
