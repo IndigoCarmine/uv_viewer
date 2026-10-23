@@ -4,7 +4,7 @@
 //! lines is followed by `XYDATA` and the data itself, in one of two layouts:
 //!
 //! - single column: `x\ty` per line;
-//! - multi column: a tab-led label row (`\t110\t104.99\t...`, usually the
+//! - multi column: a tab-led label row (`\t85\t70.02\t...`, usually the
 //!   temperature of each scan) followed by `x\ty1\ty2...` per line.
 //!
 //! Some files end with an `##### Extended Information` section, which is ignored.
