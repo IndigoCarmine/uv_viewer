@@ -38,33 +38,57 @@ pub const EXTENSIONS: &[&str] = &["png", "svg", "pdf"];
 /// Line width of every curve, the same as on screen.
 const LINE_WIDTH: f32 = 1.5;
 
+// Text limits.
+//
+// Axis titles and legend names come from the input file (its XUNITS / YUNITS
+// values and column label row) without any length or count limit, and the
+// figure is written on the UI thread. ruviz's PDF export is slow in that text:
+// super-linear in the length of one text (about quadratic, 0.6 s for 25 000
+// characters, 33 s for 200 000) and, in the legend, about 0.9 ms per entry
+// plus 0.15 ms per CJK character (ASCII is far cheaper), whatever the number
+// of curves. All timings are release builds of ruviz 0.15.1 writing PDF. The
+// three limits below bound the worst case and leave every real figure
+// untouched: 5000 curves with CJK names of 30, 100 or 1000 characters and
+// both axis titles 100 000 CJK characters long are written in 0.58-0.63 s
+// (1000 curves with 200-character CJK names took 34 s without the legend
+// limits, 0.54 s with them).
+
 /// Longest axis title or legend name, in characters, that is handed to ruviz;
 /// [`figure_text`] cuts longer text to this length, ending in an ellipsis.
 ///
-/// Both texts come from the input file (its XUNITS / YUNITS values and column
-/// label row) without any length limit, and ruviz's PDF export takes time
-/// super-linear in the length of one text: about quadratic, from 0.6 s for
-/// 25 000 characters to 33 s for 200 000 in a release build, on the UI thread.
 /// Real units and labels are a few dozen characters, and the 640 px wide
-/// figure holds only about 90 characters of ruviz's 13.9 px label font, so 200
-/// loses nothing readable while keeping the export time negligible.
-const MAX_TEXT_CHARS: usize = 200;
+/// figure holds only about 90 average Latin characters of ruviz's 13.9 px
+/// label font (about 45 CJK ones), so nothing readable is cut. One text this
+/// long takes about 20 ms.
+const MAX_TEXT_CHARS: usize = 100;
+
+/// Most legend entries handed to ruviz; [`legend_labels`] leaves the curves
+/// after them without a label, so they are drawn but not listed. 100
+/// one-character CJK entries take 0.1 s (1000 take 0.94 s).
+const MAX_LEGEND_ENTRIES: usize = 100;
+
+/// Most characters, summed over all legend entries, handed to ruviz;
+/// [`legend_labels`] stops labelling at the first entry that would go past
+/// it. 3000 CJK characters take about 0.45 s (100 entries of 30: 0.54 s; 50 of
+/// 60: 0.53 s), against 34 s for 1000 entries of 200 without this budget.
+const MAX_LEGEND_CHARS: usize = 3000;
 
 /// Marks the end of a text cut by [`figure_text`].
 const ELLIPSIS: char = '\u{2026}';
 
 /// `text` as it is handed to ruviz: at most [`MAX_TEXT_CHARS`] characters,
-/// cut on a `char` boundary and ending in [`ELLIPSIS`] when longer, and with
-/// every control character replaced by U+FFFD. ruviz writes text into SVG
-/// unchanged, and most control characters (NUL, for one) are not allowed in
-/// XML, so they would make the SVG invalid and the PDF export fail.
+/// cut on a `char` boundary and ending in [`ELLIPSIS`] when longer.
+///
+/// ruviz writes text into SVG unchanged, and the characters XML does not allow
+/// (control characters other than TAB / LF / CR, and U+FFFE / U+FFFF) would
+/// make the SVG invalid and the PDF export fail, so they become U+FFFD. TAB, LF
+/// and CR are allowed but do not lay out as one line, so they become spaces.
 fn figure_text(text: &str) -> String {
-    let clean = |c: char| {
-        if c.is_control() {
-            char::REPLACEMENT_CHARACTER
-        } else {
-            c
-        }
+    let clean = |c: char| match c {
+        '\t' | '\n' | '\r' => ' ',
+        '\u{FFFE}' | '\u{FFFF}' => char::REPLACEMENT_CHARACTER,
+        c if c.is_control() => char::REPLACEMENT_CHARACTER,
+        c => c,
     };
     if text.chars().nth(MAX_TEXT_CHARS).is_none() {
         return text.chars().map(clean).collect();
@@ -73,6 +97,29 @@ fn figure_text(text: &str) -> String {
         .take(MAX_TEXT_CHARS - 1)
         .map(clean)
         .chain([ELLIPSIS])
+        .collect()
+}
+
+/// The legend label of each drawn curve, in order, as handed to ruviz.
+///
+/// Each name goes through [`figure_text`]. The labelled curves are always the
+/// first ones: labelling stops for good at the first curve past
+/// [`MAX_LEGEND_ENTRIES`] or whose label would take the total past
+/// [`MAX_LEGEND_CHARS`], and that curve and all later ones get `None`. ruviz
+/// lists a series given any label, even an empty one, so `None` means the
+/// series must be given no label at all.
+fn legend_labels<'a>(names: impl IntoIterator<Item = &'a str>) -> Vec<Option<String>> {
+    let mut total = 0;
+    let mut open = true;
+    names
+        .into_iter()
+        .enumerate()
+        .map(|(k, name)| {
+            let label = figure_text(name);
+            total += label.chars().count();
+            open = open && k < MAX_LEGEND_ENTRIES && total <= MAX_LEGEND_CHARS;
+            open.then_some(label)
+        })
         .collect()
 }
 
@@ -116,31 +163,38 @@ pub fn write_figure(path: &Path, figure: &Figure) -> Result<(), String> {
         ))
     })?;
 
+    let drawn: Vec<(&FigureCurve, Vec<f64>, Vec<f64>)> = figure
+        .curves
+        .iter()
+        .filter_map(|curve| {
+            let (xs, ys): (Vec<f64>, Vec<f64>) = curve
+                .points
+                .iter()
+                .filter(|[x, y]| x.is_finite() && y.is_finite())
+                .map(|&[x, y]| (x, y))
+                .unzip();
+            (!xs.is_empty()).then_some((curve, xs, ys))
+        })
+        .collect();
+    if drawn.is_empty() {
+        return Err(fail("no curve with finite points to draw".into()));
+    }
+    let labels = legend_labels(drawn.iter().map(|(curve, _, _)| curve.name.as_str()));
+
     let mut plot = Plot::new()
         .xlabel(figure_text(&figure.x_title))
         .ylabel(figure_text(&figure.y_title));
-    let mut drawn = 0;
-    for curve in &figure.curves {
-        let (xs, ys): (Vec<f64>, Vec<f64>) = curve
-            .points
-            .iter()
-            .filter(|[x, y]| x.is_finite() && y.is_finite())
-            .map(|&[x, y]| (x, y))
-            .unzip();
-        if xs.is_empty() {
-            continue;
-        }
+    for ((curve, xs, ys), label) in drawn.iter().zip(labels) {
         let [r, g, b, a] = curve.color.to_srgba_unmultiplied();
-        plot = plot
-            .line(&xs, &ys)
-            .label(figure_text(&curve.name))
+        let series = plot.line(xs, ys);
+        let series = match label {
+            Some(label) => series.label(label),
+            None => series,
+        };
+        plot = series
             .color(Color::from_rgba(r, g, b, a))
             .line_width(LINE_WIDTH)
             .into();
-        drawn += 1;
-    }
-    if drawn == 0 {
-        return Err(fail("no curve with finite points to draw".into()));
     }
     if figure.legend {
         plot = plot.legend_best();
@@ -434,26 +488,101 @@ mod tests {
     #[test]
     fn control_characters_are_replaced() {
         assert_eq!(
-            figure_text("a\0b\x07c\td\ne"),
-            "a\u{FFFD}b\u{FFFD}c\u{FFFD}d\u{FFFD}e"
+            figure_text("a\0b\x07c\u{FFFE}d\u{FFFF}e\x7f"),
+            "a\u{FFFD}b\u{FFFD}c\u{FFFD}d\u{FFFD}e\u{FFFD}"
         );
+        assert_eq!(figure_text("a\tb\nc\r\nd"), "a b c  d");
 
         let dir = TempDir::new("control");
-        let mut figure = one_curve("a\0b", vec![[1.0, 1.0], [2.0, 3.0]]);
+        let mut figure = one_curve("a\0b\u{FFFE}", vec![[1.0, 1.0], [2.0, 3.0]]);
+        figure.x_title = "nm\u{FFFF}".into();
         figure.y_title = "Abs\x07".into();
         let svg_path = dir.path("figure.svg");
         write_figure(&svg_path, &figure).expect("write SVG");
         let svg = std::fs::read_to_string(&svg_path).expect("read SVG");
         assert!(
-            !svg.contains('\0') && !svg.contains('\x07'),
-            "raw control character in SVG"
+            !svg.contains(['\0', '\x07', '\u{FFFE}', '\u{FFFF}']),
+            "character not allowed in XML written to SVG"
         );
-        assert!(svg.contains("a\u{FFFD}b"), "SVG lacks the legend name");
+        assert!(
+            svg.contains("a\u{FFFD}b\u{FFFD}"),
+            "SVG lacks the legend name"
+        );
+        assert!(svg.contains("nm\u{FFFD}"), "SVG lacks the x title");
         assert!(svg.contains("Abs\u{FFFD}"), "SVG lacks the y title");
 
         let pdf_path = dir.path("figure.pdf");
         write_figure(&pdf_path, &figure).expect("write PDF");
         assert!(std::fs::read(&pdf_path).unwrap().starts_with(PDF_SIGNATURE));
+    }
+
+    #[test]
+    fn legend_labels_keep_a_normal_figure_unchanged() {
+        let names = ["sample A", "合成試料その一 25℃", "Blank"];
+        let labels = legend_labels(names);
+        let expected: Vec<Option<String>> = names.iter().map(|n| Some(n.to_string())).collect();
+        assert_eq!(labels, expected);
+    }
+
+    /// Checks the legend limits on `labels`: the labelled entries come first
+    /// and stay within the entry count and the total character budget.
+    fn assert_legend_bounded(labels: &[Option<String>]) -> usize {
+        let labelled = labels.iter().take_while(|l| l.is_some()).count();
+        assert!(
+            labels[labelled..].iter().all(Option::is_none),
+            "a label after the first unlabelled curve"
+        );
+        assert!(labelled <= MAX_LEGEND_ENTRIES, "{labelled} entries");
+        let total: usize = labels.iter().flatten().map(|l| l.chars().count()).sum();
+        assert!(total <= MAX_LEGEND_CHARS, "{total} legend characters");
+        labelled
+    }
+
+    #[test]
+    fn legend_labels_bound_the_total_legend_text() {
+        // Many long CJK names: the character budget stops the labels.
+        let long = "合".repeat(10_000);
+        let labels = legend_labels(std::iter::repeat_n(long.as_str(), 1000));
+        assert_eq!(labels.len(), 1000);
+        let labelled = assert_legend_bounded(&labels);
+        assert_eq!(labelled, MAX_LEGEND_CHARS / MAX_TEXT_CHARS);
+        assert_eq!(labels[0].as_deref(), Some(figure_text(&long).as_str()));
+
+        // Many one-character names: the entry count stops the labels.
+        let labels = legend_labels(std::iter::repeat_n("合", 5000));
+        assert_eq!(assert_legend_bounded(&labels), MAX_LEGEND_ENTRIES);
+
+        // A name that does not fit ends the labels, even when a later, shorter
+        // one would still fit: 30 x 99 = 2970, then 100 does not fit, 1 would.
+        let mut names = vec!["合".repeat(99); 30];
+        names.push("合".repeat(MAX_TEXT_CHARS));
+        names.push("合".into());
+        let labels = legend_labels(names.iter().map(String::as_str));
+        assert_eq!(assert_legend_bounded(&labels), 30);
+        assert_eq!(labels.len(), 32);
+    }
+
+    #[test]
+    fn many_long_cjk_names_give_a_bounded_svg_legend() {
+        let dir = TempDir::new("many-names");
+        let figure = Figure {
+            curves: (0..1000)
+                .map(|k| FigureCurve {
+                    name: "合".repeat(1000),
+                    points: vec![[1.0, k as f64], [2.0, k as f64 + 1.0]],
+                    color: Color32::RED,
+                })
+                .collect(),
+            x_title: "Wavelength [nm]".into(),
+            y_title: "Abs".into(),
+            legend: true,
+        };
+        let path = dir.path("figure.svg");
+        write_figure(&path, &figure).expect("write SVG");
+        let svg = std::fs::read_to_string(&path).expect("read SVG");
+        let cjk = svg.chars().filter(|&c| c == '合').count();
+        assert!(cjk > 0, "no legend text in SVG");
+        assert!(cjk <= MAX_LEGEND_CHARS, "{cjk} legend characters in SVG");
     }
 
     #[test]
