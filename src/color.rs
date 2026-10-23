@@ -109,8 +109,7 @@ pub fn next_single(in_use: impl IntoIterator<Item = Color32>) -> Color32 {
 /// curves are spread evenly in file order.
 pub fn gradient_positions<'a>(labels: impl ExactSizeIterator<Item = &'a str>) -> Vec<f32> {
     let count = labels.len();
-    let values: Option<Vec<f64>> = labels.map(|l| l.trim().parse::<f64>().ok()).collect();
-    if let Some(values) = values {
+    if let Some(values) = label_values(labels) {
         let min = values.iter().copied().fold(f64::INFINITY, f64::min);
         let max = values.iter().copied().fold(f64::NEG_INFINITY, f64::max);
         if max > min {
@@ -128,6 +127,19 @@ pub fn gradient_positions<'a>(labels: impl ExactSizeIterator<Item = &'a str>) ->
                 0.0
             }
         })
+        .collect()
+}
+
+/// The labels read as numbers (surrounding whitespace ignored), or `None`
+/// unless every label is one. Multi-column files label each scan with its
+/// temperature, so this is that series.
+///
+/// Anything [`f64`]'s parser accepts counts, `"inf"` and `"NaN"` included;
+/// callers that need finite values check for them.
+pub fn label_values<'a>(labels: impl IntoIterator<Item = &'a str>) -> Option<Vec<f64>> {
+    labels
+        .into_iter()
+        .map(|l| l.trim().parse::<f64>().ok())
         .collect()
 }
 
@@ -160,6 +172,17 @@ mod tests {
     fn text_labels_position_by_order() {
         let t = gradient_positions(["a", "b", "c"].into_iter());
         assert_eq!(t, vec![0.0, 0.5, 1.0]);
+    }
+
+    #[test]
+    fn label_values_parses_only_when_every_label_is_a_number() {
+        assert_eq!(
+            label_values([" 85", "70.02 ", "-5", "1e2"]),
+            Some(vec![85.0, 70.02, -5.0, 100.0])
+        );
+        assert_eq!(label_values(["85", "warm"]), None);
+        assert_eq!(label_values(["85", ""]), None);
+        assert_eq!(label_values(Vec::<&str>::new()), Some(vec![]));
     }
 
     #[test]

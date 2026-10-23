@@ -11,6 +11,7 @@ pub mod figure;
 pub(crate) mod fixtures;
 pub mod jasco;
 pub mod processing;
+pub mod trace;
 
 pub use app::UvViewerApp;
 
