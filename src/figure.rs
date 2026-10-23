@@ -38,6 +38,44 @@ pub const EXTENSIONS: &[&str] = &["png", "svg", "pdf"];
 /// Line width of every curve, the same as on screen.
 const LINE_WIDTH: f32 = 1.5;
 
+/// Longest axis title or legend name, in characters, that is handed to ruviz;
+/// [`figure_text`] cuts longer text to this length, ending in an ellipsis.
+///
+/// Both texts come from the input file (its XUNITS / YUNITS values and column
+/// label row) without any length limit, and ruviz's PDF export takes time
+/// super-linear in the length of one text: about quadratic, from 0.6 s for
+/// 25 000 characters to 33 s for 200 000 in a release build, on the UI thread.
+/// Real units and labels are a few dozen characters, and the 640 px wide
+/// figure holds only about 90 characters of ruviz's 13.9 px label font, so 200
+/// loses nothing readable while keeping the export time negligible.
+const MAX_TEXT_CHARS: usize = 200;
+
+/// Marks the end of a text cut by [`figure_text`].
+const ELLIPSIS: char = '\u{2026}';
+
+/// `text` as it is handed to ruviz: at most [`MAX_TEXT_CHARS`] characters,
+/// cut on a `char` boundary and ending in [`ELLIPSIS`] when longer, and with
+/// every control character replaced by U+FFFD. ruviz writes text into SVG
+/// unchanged, and most control characters (NUL, for one) are not allowed in
+/// XML, so they would make the SVG invalid and the PDF export fail.
+fn figure_text(text: &str) -> String {
+    let clean = |c: char| {
+        if c.is_control() {
+            char::REPLACEMENT_CHARACTER
+        } else {
+            c
+        }
+    };
+    if text.chars().nth(MAX_TEXT_CHARS).is_none() {
+        return text.chars().map(clean).collect();
+    }
+    text.chars()
+        .take(MAX_TEXT_CHARS - 1)
+        .map(clean)
+        .chain([ELLIPSIS])
+        .collect()
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Format {
     Png,
@@ -79,8 +117,8 @@ pub fn write_figure(path: &Path, figure: &Figure) -> Result<(), String> {
     })?;
 
     let mut plot = Plot::new()
-        .xlabel(figure.x_title.as_str())
-        .ylabel(figure.y_title.as_str());
+        .xlabel(figure_text(&figure.x_title))
+        .ylabel(figure_text(&figure.y_title));
     let mut drawn = 0;
     for curve in &figure.curves {
         let (xs, ys): (Vec<f64>, Vec<f64>) = curve
@@ -95,7 +133,7 @@ pub fn write_figure(path: &Path, figure: &Figure) -> Result<(), String> {
         let [r, g, b, a] = curve.color.to_srgba_unmultiplied();
         plot = plot
             .line(&xs, &ys)
-            .label(curve.name.as_str())
+            .label(figure_text(&curve.name))
             .color(Color::from_rgba(r, g, b, a))
             .line_width(LINE_WIDTH)
             .into();
@@ -332,6 +370,90 @@ mod tests {
             !svg.contains("all NaN"),
             "curve without finite points drawn"
         );
+    }
+
+    #[test]
+    fn very_long_legend_name_and_axis_title_are_shortened() {
+        let dir = TempDir::new("long-text");
+        // Far beyond the cap, multi-byte, as from a crafted file's header.
+        let long_name = "合成".repeat(100_000);
+        let long_x = "nm".repeat(100_000);
+        let mut figure = one_curve(&long_name, vec![[1.0, 1.0], [2.0, 3.0]]);
+        figure.x_title = long_x.clone();
+
+        let svg_path = dir.path("figure.svg");
+        write_figure(&svg_path, &figure).expect("write SVG");
+        let svg = std::fs::read_to_string(&svg_path).expect("read SVG");
+        let shortened =
+            |text: &str| text.chars().take(MAX_TEXT_CHARS - 1).collect::<String>() + "…";
+        let short_name = shortened(&long_name);
+        let short_x = shortened(&long_x);
+        assert!(
+            svg.contains(&short_name),
+            "SVG lacks the shortened legend name"
+        );
+        assert!(svg.contains(&short_x), "SVG lacks the shortened x title");
+        assert!(
+            !svg.contains(&long_x[..2 * MAX_TEXT_CHARS]),
+            "x title not shortened"
+        );
+
+        let pdf_path = dir.path("figure.pdf");
+        write_figure(&pdf_path, &figure).expect("write PDF");
+        let bytes = std::fs::read(&pdf_path).expect("read PDF");
+        assert!(bytes.starts_with(PDF_SIGNATURE), "not a PDF file");
+
+        let png_path = dir.path("figure.png");
+        write_figure(&png_path, &figure).expect("write PNG");
+        let bytes = std::fs::read(&png_path).expect("read PNG");
+        assert!(bytes.starts_with(PNG_SIGNATURE), "not a PNG file");
+    }
+
+    #[test]
+    fn figure_text_keeps_short_text_and_cuts_long_text_on_char_boundaries() {
+        for text in ["", "Wavelength [nm]", "合成試料その一 25℃"] {
+            assert_eq!(figure_text(text), text);
+        }
+        let at_cap = "あ".repeat(MAX_TEXT_CHARS);
+        assert_eq!(figure_text(&at_cap), at_cap);
+
+        let over_cap = "あ".repeat(MAX_TEXT_CHARS + 1);
+        let cut = figure_text(&over_cap);
+        assert_eq!(cut.chars().count(), MAX_TEXT_CHARS);
+        assert_eq!(cut, "あ".repeat(MAX_TEXT_CHARS - 1) + "…");
+
+        // A base letter and its combining mark are two chars; cutting between
+        // them must not panic, and the result stays at the cap.
+        let combining = "e\u{301}".repeat(MAX_TEXT_CHARS);
+        let cut = figure_text(&combining);
+        assert_eq!(cut.chars().count(), MAX_TEXT_CHARS);
+        assert!(cut.ends_with('…'));
+        assert!(combining.starts_with(cut.trim_end_matches('…')));
+    }
+
+    #[test]
+    fn control_characters_are_replaced() {
+        assert_eq!(
+            figure_text("a\0b\x07c\td\ne"),
+            "a\u{FFFD}b\u{FFFD}c\u{FFFD}d\u{FFFD}e"
+        );
+
+        let dir = TempDir::new("control");
+        let mut figure = one_curve("a\0b", vec![[1.0, 1.0], [2.0, 3.0]]);
+        figure.y_title = "Abs\x07".into();
+        let svg_path = dir.path("figure.svg");
+        write_figure(&svg_path, &figure).expect("write SVG");
+        let svg = std::fs::read_to_string(&svg_path).expect("read SVG");
+        assert!(
+            !svg.contains('\0') && !svg.contains('\x07'),
+            "raw control character in SVG"
+        );
+        assert!(svg.contains("a\u{FFFD}b"), "SVG lacks the legend name");
+        assert!(svg.contains("Abs\u{FFFD}"), "SVG lacks the y title");
+
+        let pdf_path = dir.path("figure.pdf");
+        write_figure(&pdf_path, &figure).expect("write PDF");
+        assert!(std::fs::read(&pdf_path).unwrap().starts_with(PDF_SIGNATURE));
     }
 
     #[test]
