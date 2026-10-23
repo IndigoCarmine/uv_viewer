@@ -74,9 +74,9 @@ The curve's value at a *Two-point* or *Value at x* position is interpolated line
 - The save dialog (filter *CSV*, `*.csv`) starts in the folder of the first shown curve's file, with `<that file's name>_export.csv` as the file name (`spectrum.txt` → `spectrum_export.csv`).
 - If the file cannot be written, the error is shown at the bottom of the side panel, like a file that fails to load.
 
-The layout is two columns, x and y, per curve, in legend order (file order in the list, then curve order within the file):
+The layout is two columns, x and y, per curve, in the order the curves are drawn (file order in the list, then curve order within the file). The plot legend lists the names alphabetically, so its order can differ from the column order, for example for the temperature scans of a multi-column file.
 
-1. Row 1 — the curve's legend name in both of its columns: the file name, or `<file name>: <label>` for a curve of a multi-column file.
+1. Row 1 — the curve's legend name in both of its columns: the file name without its extension, or `<file name>: <label>` for a curve of a multi-column file.
 2. Row 2 — the x and y titles of the curve's own file, derived from `XUNITS` / `YUNITS` as for the plot axes (*Normalized* for y while normalisation is on). The plot's axis titles follow the first visible file only, so when files with different units are shown together, these headers can differ from the plot's axis titles.
 3. Row 3 onwards — one point per row. Every curve keeps its own x values, so curves on different x grids stay paired with their x. Below the end of a curve shorter than the longest one, both of its cells are empty.
 
@@ -93,7 +93,7 @@ To read it with pandas, use both header rows and the `utf-8-sig` encoding (which
 import pandas as pd
 
 df = pd.read_csv("spectrum_export.csv", header=[0, 1], encoding="utf-8-sig")
-spectrum = df["spectrum"].dropna()  # the x and y columns of one curve, without the padding
+spectrum = df["spectrum"].dropna()  # the x and y columns of one curve, without empty cells (padding, NaN/inf)
 ```
 
 The columns are then `(name, header)` pairs, such as `("spectrum", "Wavelength / nm")`.
@@ -125,6 +125,7 @@ The code is split by concern:
 - [`src/jasco.rs`](src/jasco.rs) — parser for the JASCO text export.
 - [`src/processing.rs`](src/processing.rs) — baseline correction and normalisation.
 - [`src/color.rs`](src/color.rs) — colormaps, the single-colour palette and gradient positions.
+- [`src/export.rs`](src/export.rs) — CSV export of the shown curves.
 - [`src/app.rs`](src/app.rs) — application state, user interface and persistence.
 
 ## Making it yours
