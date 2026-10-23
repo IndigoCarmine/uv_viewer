@@ -98,6 +98,35 @@ spectrum = df["spectrum"].dropna()  # the x and y columns of one curve, without 
 
 The columns are then `(name, header)` pairs, such as `("spectrum", "Wavelength / nm")`.
 
+### Exporting a figure
+
+**File → Export figure…** draws the shown curves with [ruviz](https://crates.io/crates/ruviz) and saves the figure as PNG, SVG or PDF. The plot in the window is left as it is.
+
+- The same curves as for the CSV export are drawn: those whose file checkbox and own checkbox are both on, including curves hidden by clicking their entry in the plot legend. The menu item is disabled while no curve is shown.
+- The figure matches the plot: the processed values (after baseline correction and normalisation), the curve colours shown on screen, the legend names, and the plot's axis titles (from the first visible file, so for files with different units they can differ from the CSV's second header row).
+- The legend is drawn when **Show legend** is on, inside the plot area, where ruviz finds it overlaps the curves least. It lists the curves in drawing order (file order in the list, then curve order within the file), like the CSV columns, whereas the legend in the window is alphabetical.
+- NaN and infinite points are left out of the figure. A curve without any finite point is not drawn; if no shown curve has one, nothing is written and an error is shown.
+- The save dialog offers a *PNG*, *SVG* and *PDF* filter and starts in the folder of the first shown curve's file, with `<that file's name>_figure.png` as the file name (`spectrum.txt` → `spectrum_figure.png`).
+- The format follows the extension of the saved file name, `.png`, `.svg` or `.pdf`, in any letter case. With any other extension, or none, nothing is written and the error says `unsupported figure format (supported: .png / .svg / .pdf)`.
+- Errors (an unsupported extension, a file that cannot be written) are shown at the bottom of the side panel, like a file that fails to load.
+- The figure is drawn while the window waits, so the window can pause for a moment, most noticeably for PNG.
+
+The formats:
+
+- **PNG** — a bitmap image.
+- **SVG** — a vector image. The text stays text and is drawn with the fonts of the program that opens the file.
+- **PDF** — a vector image on a 160 × 120 mm page (ruviz's default size).
+
+In PNG and PDF the text is drawn with the fonts installed in the OS, so a Japanese or other CJK legend name needs a font that covers those characters.
+
+To find those fonts quickly, ruviz keeps a list of the installed font files (their paths, sizes and modification times, not the fonts themselves) in a cache file, which it reads at the first figure export after the viewer starts, and writes when it is missing or the installed fonts have changed:
+
+- Windows: `%LOCALAPPDATA%\ruviz\font-cache-v1.tsv`
+- macOS: `~/Library/Caches/ruviz/font-cache-v1.tsv`
+- Linux: no cache file is written; the fonts are looked up again at the first figure export of every run.
+
+Set the environment variable `RUVIZ_FONT_CACHE=0` to turn the cache off, or `RUVIZ_FONT_CACHE=<folder>` to keep it at `<folder>/font-cache-v1.tsv` instead.
+
 ### Saved state
 
 The open files and the settings are saved by eframe's `persistence` feature and restored on the next start: the file paths and their order, file and curve visibility, colour modes and curve colours, the processing settings and the legend toggle. Only the paths are stored, not the data, so the files are re-read from disk on startup. A file that can no longer be read is removed from the list and reported as an error. A file's per-curve settings are kept as long as it still has the same number of curves; otherwise they are reset.
@@ -126,6 +155,7 @@ The code is split by concern:
 - [`src/processing.rs`](src/processing.rs) — baseline correction and normalisation.
 - [`src/color.rs`](src/color.rs) — colormaps, the single-colour palette and gradient positions.
 - [`src/export.rs`](src/export.rs) — CSV export of the shown curves.
+- [`src/figure.rs`](src/figure.rs) — figure export (PNG / SVG / PDF) of the shown curves with ruviz.
 - [`src/app.rs`](src/app.rs) — application state, user interface and persistence.
 
 ## Making it yours
